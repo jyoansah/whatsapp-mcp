@@ -12,7 +12,13 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    schedule_message as whatsapp_schedule_message,
+    list_scheduled_messages as whatsapp_list_scheduled_messages,
+    cancel_scheduled_message as whatsapp_cancel_scheduled_message,
+    watch_channel as whatsapp_watch_channel,
+    unwatch_channel as whatsapp_unwatch_channel,
+    list_watched_channels as whatsapp_list_watched_channels
 )
 
 # Initialize FastMCP server
@@ -224,16 +230,16 @@ def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
-    
+
     Args:
         message_id: The ID of the message containing the media
         chat_jid: The JID of the chat containing the message
-    
+
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
     file_path = whatsapp_download_media(message_id, chat_jid)
-    
+
     if file_path:
         return {
             "success": True,
@@ -246,6 +252,150 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+@mcp.tool()
+def schedule_message(
+    recipient: str,
+    message: str,
+    scheduled_time: str,
+    media_path: Optional[str] = None
+) -> Dict[str, Any]:
+    """Schedule a WhatsApp message for future delivery.
+
+    Args:
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        message: The message text to send
+        scheduled_time: When to send the message in ISO 8601 format (e.g., "2024-12-25T10:00:00Z")
+        media_path: Optional absolute path to a media file to send with the message
+
+    Returns:
+        A dictionary containing success status, a status message, and the scheduled message ID
+    """
+    if not recipient:
+        return {
+            "success": False,
+            "message": "Recipient must be provided"
+        }
+
+    if not message and not media_path:
+        return {
+            "success": False,
+            "message": "Message or media_path must be provided"
+        }
+
+    success, status_message, message_id = whatsapp_schedule_message(
+        recipient, message, scheduled_time, media_path
+    )
+
+    result = {
+        "success": success,
+        "message": status_message
+    }
+    if message_id:
+        result["scheduled_message_id"] = message_id
+
+    return result
+
+@mcp.tool()
+def list_scheduled_messages(status: Optional[str] = None) -> Dict[str, Any]:
+    """List all scheduled WhatsApp messages.
+
+    Args:
+        status: Optional filter by status - "pending", "sent", or "failed"
+
+    Returns:
+        A dictionary containing the list of scheduled messages and count
+    """
+    messages = whatsapp_list_scheduled_messages(status)
+    return {
+        "success": True,
+        "messages": messages,
+        "count": len(messages)
+    }
+
+@mcp.tool()
+def cancel_scheduled_message(message_id: int) -> Dict[str, Any]:
+    """Cancel a pending scheduled WhatsApp message.
+
+    Args:
+        message_id: The ID of the scheduled message to cancel
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_cancel_scheduled_message(message_id)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def watch_channel(jid: str, name: Optional[str] = None) -> Dict[str, Any]:
+    """Add a WhatsApp channel/chat to the watch list. Messages from watched channels trigger webhooks to the configured WHATSAPP_WEBHOOK_URL.
+
+    Args:
+        jid: The JID of the channel to watch (e.g., "123456789@s.whatsapp.net" or group JID)
+        name: Optional friendly name for the channel
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not jid:
+        return {
+            "success": False,
+            "message": "JID must be provided"
+        }
+
+    success, status_message = whatsapp_watch_channel(jid, name)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def unwatch_channel(jid: str) -> Dict[str, Any]:
+    """Remove a WhatsApp channel/chat from the watch list.
+
+    Args:
+        jid: The JID of the channel to stop watching
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not jid:
+        return {
+            "success": False,
+            "message": "JID must be provided"
+        }
+
+    success, status_message = whatsapp_unwatch_channel(jid)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def list_watched_channels() -> Dict[str, Any]:
+    """List all WhatsApp channels/chats being watched for webhook notifications.
+
+    Returns:
+        A dictionary containing the list of watched channels, count, and configured webhook URL
+    """
+    result = whatsapp_list_watched_channels()
+    return {
+        "success": True,
+        "channels": result.get("channels", []),
+        "count": result.get("count", 0),
+        "webhook_url": result.get("webhook_url", "")
+    }
+
 if __name__ == "__main__":
+    import os
     # Initialize and run the server
-    mcp.run(transport='stdio')
+    transport = os.environ.get('MCP_TRANSPORT', 'stdio')
+    port = int(os.environ.get('MCP_PORT', '8000'))
+    if transport == 'sse':
+        import uvicorn
+        uvicorn.run(mcp.sse_app(), host='0.0.0.0', port=port)
+    else:
+        mcp.run(transport='stdio')

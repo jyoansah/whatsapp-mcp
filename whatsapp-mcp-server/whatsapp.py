@@ -765,3 +765,213 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# Scheduling functions
+
+@dataclass
+class ScheduledMessage:
+    id: int
+    recipient: str
+    message: str
+    media_path: Optional[str]
+    scheduled_time: datetime
+    status: str
+    created_at: datetime
+    sent_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+
+def schedule_message(recipient: str, message: str, scheduled_time: str, media_path: Optional[str] = None) -> Tuple[bool, str, Optional[int]]:
+    """Schedule a WhatsApp message for future delivery.
+
+    Args:
+        recipient: Phone number or JID
+        message: Message text
+        scheduled_time: ISO 8601 formatted datetime string
+        media_path: Optional path to media file
+
+    Returns:
+        Tuple of (success, status_message, scheduled_message_id)
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/schedule"
+        payload = {
+            "recipient": recipient,
+            "message": message,
+            "scheduled_time": scheduled_time
+        }
+        if media_path:
+            payload["media_path"] = media_path
+
+        response = requests.post(url, json=payload)
+        result = response.json()
+
+        if result.get("success", False):
+            return True, result.get("message", "Scheduled successfully"), result.get("id")
+        else:
+            return False, result.get("message", "Unknown error"), None
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except json.JSONDecodeError:
+        return False, f"Error parsing response", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def list_scheduled_messages(status: Optional[str] = None) -> List[dict]:
+    """Get all scheduled messages, optionally filtered by status.
+
+    Args:
+        status: Optional filter - 'pending', 'sent', or 'failed'
+
+    Returns:
+        List of scheduled message dictionaries
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/schedule"
+        params = {}
+        if status:
+            params["status"] = status
+
+        response = requests.get(url, params=params)
+        result = response.json()
+
+        if result.get("success", False):
+            return result.get("data", [])
+        else:
+            print(f"Error: {result.get('message', 'Unknown error')}")
+            return []
+
+    except requests.RequestException as e:
+        print(f"Request error: {str(e)}")
+        return []
+    except json.JSONDecodeError:
+        print(f"Error parsing response")
+        return []
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        return []
+
+
+def cancel_scheduled_message(message_id: int) -> Tuple[bool, str]:
+    """Cancel a pending scheduled message.
+
+    Args:
+        message_id: The ID of the scheduled message to cancel
+
+    Returns:
+        Tuple of (success, status_message)
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/schedule"
+        params = {"id": message_id}
+
+        response = requests.delete(url, params=params)
+        result = response.json()
+
+        return result.get("success", False), result.get("message", "Unknown error")
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+# Channel watching functions
+
+@dataclass
+class WatchedChannel:
+    jid: str
+    name: str
+    created_at: datetime
+
+
+def watch_channel(jid: str, name: Optional[str] = None) -> Tuple[bool, str]:
+    """Add a channel to the watch list.
+
+    Args:
+        jid: The JID of the channel to watch
+        name: Optional name for the channel
+
+    Returns:
+        Tuple of (success, status_message)
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/watch"
+        payload = {"jid": jid}
+        if name:
+            payload["name"] = name
+
+        response = requests.post(url, json=payload)
+        result = response.json()
+
+        return result.get("success", False), result.get("message", "Unknown error")
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def unwatch_channel(jid: str) -> Tuple[bool, str]:
+    """Remove a channel from the watch list.
+
+    Args:
+        jid: The JID of the channel to unwatch
+
+    Returns:
+        Tuple of (success, status_message)
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/watch"
+        params = {"jid": jid}
+
+        response = requests.delete(url, params=params)
+        result = response.json()
+
+        return result.get("success", False), result.get("message", "Unknown error")
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def list_watched_channels() -> dict:
+    """Get all watched channels.
+
+    Returns:
+        Dictionary with channels list, count, and webhook_url
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/watch"
+        response = requests.get(url)
+        result = response.json()
+
+        if result.get("success", False):
+            return {
+                "channels": result.get("channels", []),
+                "count": result.get("count", 0),
+                "webhook_url": result.get("webhook_url", "")
+            }
+        else:
+            print(f"Error: {result.get('message', 'Unknown error')}")
+            return {"channels": [], "count": 0, "webhook_url": ""}
+
+    except requests.RequestException as e:
+        print(f"Request error: {str(e)}")
+        return {"channels": [], "count": 0, "webhook_url": ""}
+    except json.JSONDecodeError:
+        print(f"Error parsing response")
+        return {"channels": [], "count": 0, "webhook_url": ""}
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        return {"channels": [], "count": 0, "webhook_url": ""}
