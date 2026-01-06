@@ -78,6 +78,26 @@ Here's an example of what you can do when it's connected to Claude.
    ~/.cursor/mcp.json
    ```
 
+   For **SSE transport** (remote access), run the MCP server with:
+
+   ```bash
+   cd whatsapp-mcp-server
+   MCP_TRANSPORT=sse MCP_PORT=8000 uv run main.py
+   ```
+
+   Then configure your MCP client to use the SSE endpoint:
+
+   ```json
+   {
+     "mcpServers": {
+       "whatsapp": {
+         "type": "sse",
+         "url": "http://localhost:8000/sse"
+       }
+     }
+   }
+   ```
+
 4. **Restart Claude Desktop / Cursor**
 
    Open Claude Desktop and you should now see WhatsApp as an available integration.
@@ -140,6 +160,30 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **schedule_message**: Schedule a message for future delivery
+- **list_scheduled_messages**: List all scheduled messages with optional status filter
+- **cancel_scheduled_message**: Cancel a pending scheduled message
+- **watch_channel**: Add a channel to receive webhook notifications for new messages
+- **unwatch_channel**: Remove a channel from the watch list
+- **list_watched_channels**: List all watched channels and the configured webhook URL
+
+### Message Scheduling
+
+You can schedule WhatsApp messages to be sent at a future time:
+
+- Schedule messages with text and/or media attachments
+- Messages are stored locally and sent automatically at the scheduled time
+- View pending, sent, and failed scheduled messages
+- Cancel pending messages before they're sent
+
+### Channel Watching
+
+Watch specific WhatsApp chats/groups and receive webhook notifications when new messages arrive:
+
+- Configure `WHATSAPP_WEBHOOK_URL` environment variable to receive notifications
+- Add/remove channels from the watch list via MCP tools or bot commands
+- Webhook payloads include message content, sender info, and media file paths
+- Send `!watch`, `!unwatch`, or `!watchlist` from WhatsApp to manage watched channels
 
 ### Media Handling Features
 
