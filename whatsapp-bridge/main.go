@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -13,15 +14,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
-
-	"bytes"
-
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -66,7 +65,7 @@ func NewMessageStore() (*MessageStore, error) {
 			name TEXT,
 			last_message_time TIMESTAMP
 		);
-		
+
 		CREATE TABLE IF NOT EXISTS messages (
 			id TEXT,
 			chat_jid TEXT,
@@ -83,6 +82,24 @@ func NewMessageStore() (*MessageStore, error) {
 			file_length INTEGER,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+
+		CREATE TABLE IF NOT EXISTS scheduled_messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			recipient TEXT NOT NULL,
+			message TEXT,
+			media_path TEXT,
+			scheduled_time TIMESTAMP NOT NULL,
+			status TEXT DEFAULT 'pending',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			sent_at TIMESTAMP,
+			error TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS watched_channels (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
 	`)
 	if err != nil {
@@ -200,6 +217,478 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// ScheduledMessage represents a message scheduled for future delivery
+type ScheduledMessage struct {
+	ID            int64     `json:"id"`
+	Recipient     string    `json:"recipient"`
+	Message       string    `json:"message"`
+	MediaPath     string    `json:"media_path,omitempty"`
+	ScheduledTime time.Time `json:"scheduled_time"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	SentAt        time.Time `json:"sent_at,omitempty"`
+	Error         string    `json:"error,omitempty"`
+}
+
+// ScheduleMessageRequest represents the request body for scheduling a message
+type ScheduleMessageRequest struct {
+	Recipient     string `json:"recipient"`
+	Message       string `json:"message"`
+	MediaPath     string `json:"media_path,omitempty"`
+	ScheduledTime string `json:"scheduled_time"` // ISO 8601 format
+}
+
+// ScheduleMessageResponse represents the response for the schedule message API
+type ScheduleMessageResponse struct {
+	Success bool              `json:"success"`
+	Message string            `json:"message"`
+	ID      int64             `json:"id,omitempty"`
+	Data    *ScheduledMessage `json:"data,omitempty"`
+}
+
+// Store a scheduled message
+func (store *MessageStore) StoreScheduledMessage(recipient, message, mediaPath string, scheduledTime time.Time) (int64, error) {
+	result, err := store.db.Exec(
+		"INSERT INTO scheduled_messages (recipient, message, media_path, scheduled_time) VALUES (?, ?, ?, ?)",
+		recipient, message, mediaPath, scheduledTime,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+// Get a scheduled message by ID
+func (store *MessageStore) GetScheduledMessage(id int64) (*ScheduledMessage, error) {
+	var msg ScheduledMessage
+	var sentAt sql.NullTime
+	var errorMsg sql.NullString
+
+	err := store.db.QueryRow(
+		"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages WHERE id = ?",
+		id,
+	).Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt, &sentAt, &errorMsg)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if sentAt.Valid {
+		msg.SentAt = sentAt.Time
+	}
+	if errorMsg.Valid {
+		msg.Error = errorMsg.String
+	}
+
+	return &msg, nil
+}
+
+// Get all scheduled messages with optional status filter
+func (store *MessageStore) GetScheduledMessages(status string) ([]ScheduledMessage, error) {
+	var rows *sql.Rows
+	var err error
+
+	if status != "" {
+		rows, err = store.db.Query(
+			"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages WHERE status = ? ORDER BY scheduled_time ASC",
+			status,
+		)
+	} else {
+		rows, err = store.db.Query(
+			"SELECT id, recipient, message, media_path, scheduled_time, status, created_at, sent_at, error FROM scheduled_messages ORDER BY scheduled_time ASC",
+		)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []ScheduledMessage
+	for rows.Next() {
+		var msg ScheduledMessage
+		var sentAt sql.NullTime
+		var errorMsg sql.NullString
+
+		err := rows.Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt, &sentAt, &errorMsg)
+		if err != nil {
+			return nil, err
+		}
+
+		if sentAt.Valid {
+			msg.SentAt = sentAt.Time
+		}
+		if errorMsg.Valid {
+			msg.Error = errorMsg.String
+		}
+
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// Get due scheduled messages (pending and scheduled_time <= now)
+func (store *MessageStore) GetDueScheduledMessages() ([]ScheduledMessage, error) {
+	rows, err := store.db.Query(
+		"SELECT id, recipient, message, media_path, scheduled_time, status, created_at FROM scheduled_messages WHERE status = 'pending' AND scheduled_time <= datetime('now') ORDER BY scheduled_time ASC",
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []ScheduledMessage
+	for rows.Next() {
+		var msg ScheduledMessage
+		err := rows.Scan(&msg.ID, &msg.Recipient, &msg.Message, &msg.MediaPath, &msg.ScheduledTime, &msg.Status, &msg.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// Update scheduled message status
+func (store *MessageStore) UpdateScheduledMessageStatus(id int64, status string, errorMsg string) error {
+	if status == "sent" {
+		_, err := store.db.Exec(
+			"UPDATE scheduled_messages SET status = ?, sent_at = datetime('now'), error = ? WHERE id = ?",
+			status, errorMsg, id,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		"UPDATE scheduled_messages SET status = ?, error = ? WHERE id = ?",
+		status, errorMsg, id,
+	)
+	return err
+}
+
+// Delete a scheduled message
+func (store *MessageStore) DeleteScheduledMessage(id int64) error {
+	result, err := store.db.Exec("DELETE FROM scheduled_messages WHERE id = ? AND status = 'pending'", id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("scheduled message not found or already processed")
+	}
+	return nil
+}
+
+// WatchedChannel represents a channel being monitored for messages
+type WatchedChannel struct {
+	JID       string    `json:"jid"`
+	Name      string    `json:"name"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// WebhookPayload represents the payload sent to external webhooks
+type WebhookPayload struct {
+	Event     string    `json:"event"`
+	Timestamp time.Time `json:"timestamp"`
+	Chat      struct {
+		JID  string `json:"jid"`
+		Name string `json:"name"`
+	} `json:"chat"`
+	Message struct {
+		ID        string `json:"id"`
+		Sender    string `json:"sender"`
+		Content   string `json:"content"`
+		IsFromMe  bool   `json:"is_from_me"`
+		MediaType string `json:"media_type,omitempty"`
+		Filename  string `json:"filename,omitempty"`
+	} `json:"message"`
+}
+
+// Add a channel to the watch list
+func (store *MessageStore) AddWatchedChannel(jid, name string) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO watched_channels (jid, name, created_at) VALUES (?, ?, datetime('now'))",
+		jid, name,
+	)
+	return err
+}
+
+// Remove a channel from the watch list
+func (store *MessageStore) RemoveWatchedChannel(jid string) error {
+	result, err := store.db.Exec("DELETE FROM watched_channels WHERE jid = ?", jid)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return fmt.Errorf("channel not found in watch list")
+	}
+	return nil
+}
+
+// Get all watched channels
+func (store *MessageStore) GetWatchedChannels() ([]WatchedChannel, error) {
+	rows, err := store.db.Query("SELECT jid, name, created_at FROM watched_channels ORDER BY created_at DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var channels []WatchedChannel
+	for rows.Next() {
+		var ch WatchedChannel
+		err := rows.Scan(&ch.JID, &ch.Name, &ch.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, ch)
+	}
+	return channels, nil
+}
+
+// Check if a channel is being watched
+func (store *MessageStore) IsChannelWatched(jid string) bool {
+	var count int
+	err := store.db.QueryRow("SELECT COUNT(*) FROM watched_channels WHERE jid = ?", jid).Scan(&count)
+	if err != nil {
+		return false
+	}
+	return count > 0
+}
+
+// Get webhook URL from environment
+func getWebhookURL() string {
+	return os.Getenv("WHATSAPP_WEBHOOK_URL")
+}
+
+// Send webhook notification for a watched channel message
+func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, logger waLog.Logger) {
+	webhookURL := getWebhookURL()
+	if webhookURL == "" {
+		return
+	}
+
+	payload := WebhookPayload{
+		Event:     "message",
+		Timestamp: time.Now(),
+	}
+	payload.Chat.JID = chatJID
+	payload.Chat.Name = chatName
+	payload.Message.ID = messageID
+	payload.Message.Sender = sender
+	payload.Message.Content = content
+	payload.Message.IsFromMe = isFromMe
+	payload.Message.MediaType = mediaType
+	payload.Message.Filename = filename
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		logger.Warnf("Failed to marshal webhook payload: %v", err)
+		return
+	}
+
+	go func() {
+		resp, err := http.Post(webhookURL, "application/json", bytes.NewBuffer(jsonData))
+		if err != nil {
+			logger.Warnf("Failed to send webhook: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			logger.Infof("Webhook sent successfully for message in %s", chatJID)
+		} else {
+			logger.Warnf("Webhook returned status %d for message in %s", resp.StatusCode, chatJID)
+		}
+	}()
+}
+
+// handleBotCommand processes commands sent via WhatsApp (messages starting with !)
+// Returns true if the message was a command that was handled
+func handleBotCommand(client *whatsmeow.Client, messageStore *MessageStore, chatJID, content string, isFromMe bool, logger waLog.Logger) bool {
+	// Only process commands from self
+	if !isFromMe {
+		return false
+	}
+
+	// Check if message starts with !
+	if !strings.HasPrefix(content, "!") {
+		return false
+	}
+
+	// Parse command and arguments
+	parts := strings.Fields(content)
+	if len(parts) == 0 {
+		return false
+	}
+
+	command := strings.ToLower(parts[0])
+	args := parts[1:]
+
+	var response string
+
+	switch command {
+	case "!watch":
+		if len(args) == 0 {
+			// If no JID provided, watch current chat
+			name := ""
+			var dbName string
+			err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&dbName)
+			if err == nil && dbName != "" {
+				name = dbName
+			} else {
+				name = chatJID
+			}
+			err = messageStore.AddWatchedChannel(chatJID, name)
+			if err != nil {
+				response = fmt.Sprintf("❌ Failed to watch: %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Now watching: %s", name)
+			}
+		} else {
+			// Watch specified JID
+			jid := args[0]
+			name := jid
+			if len(args) > 1 {
+				name = strings.Join(args[1:], " ")
+			} else {
+				var dbName string
+				err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid).Scan(&dbName)
+				if err == nil && dbName != "" {
+					name = dbName
+				}
+			}
+			err := messageStore.AddWatchedChannel(jid, name)
+			if err != nil {
+				response = fmt.Sprintf("❌ Failed to watch: %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Now watching: %s", name)
+			}
+		}
+
+	case "!unwatch":
+		if len(args) == 0 {
+			// Unwatch current chat
+			err := messageStore.RemoveWatchedChannel(chatJID)
+			if err != nil {
+				response = fmt.Sprintf("❌ %v", err)
+			} else {
+				response = "✅ Stopped watching this channel"
+			}
+		} else {
+			jid := args[0]
+			err := messageStore.RemoveWatchedChannel(jid)
+			if err != nil {
+				response = fmt.Sprintf("❌ %v", err)
+			} else {
+				response = fmt.Sprintf("✅ Stopped watching: %s", jid)
+			}
+		}
+
+	case "!watchlist":
+		channels, err := messageStore.GetWatchedChannels()
+		if err != nil {
+			response = fmt.Sprintf("❌ Failed to get watch list: %v", err)
+		} else if len(channels) == 0 {
+			response = "📋 No channels being watched\n\nWebhook URL: " + getWebhookURL()
+		} else {
+			response = fmt.Sprintf("📋 Watching %d channel(s):\n", len(channels))
+			for i, ch := range channels {
+				response += fmt.Sprintf("%d. %s\n   └ %s\n", i+1, ch.Name, ch.JID)
+			}
+			response += "\nWebhook URL: " + getWebhookURL()
+		}
+
+	case "!help":
+		response = `🤖 *WhatsApp Bot Commands*
+
+*Watch List:*
+!watch - Watch current chat
+!watch <jid> [name] - Watch specific chat
+!unwatch - Stop watching current chat
+!unwatch <jid> - Stop watching specific chat
+!watchlist - List all watched channels
+
+*Tips:*
+• Forward a message from a group, then reply with !watch
+• Webhook URL is set via WHATSAPP_WEBHOOK_URL env var`
+
+	default:
+		// Unknown command, don't respond
+		return false
+	}
+
+	// Send response back to the same chat
+	if response != "" {
+		go func() {
+			success, msg := sendWhatsAppMessage(client, chatJID, response, "")
+			if !success {
+				logger.Warnf("Failed to send command response: %s", msg)
+			}
+		}()
+	}
+
+	logger.Infof("Processed bot command: %s", command)
+	return true
+}
+
+// Start the message scheduler that checks for due messages every 30 seconds
+func startScheduler(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		// Run once immediately on startup
+		processScheduledMessages(client, messageStore, logger)
+
+		for range ticker.C {
+			processScheduledMessages(client, messageStore, logger)
+		}
+	}()
+	logger.Infof("Message scheduler started (checking every 30 seconds)")
+}
+
+// Process all due scheduled messages
+func processScheduledMessages(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger) {
+	if !client.IsConnected() {
+		return
+	}
+
+	messages, err := messageStore.GetDueScheduledMessages()
+	if err != nil {
+		logger.Warnf("Failed to get due scheduled messages: %v", err)
+		return
+	}
+
+	for _, msg := range messages {
+		logger.Infof("Processing scheduled message ID %d to %s", msg.ID, msg.Recipient)
+
+		// Send the message
+		success, resultMsg := sendWhatsAppMessage(client, msg.Recipient, msg.Message, msg.MediaPath)
+
+		if success {
+			err = messageStore.UpdateScheduledMessageStatus(msg.ID, "sent", "")
+			if err != nil {
+				logger.Warnf("Failed to update scheduled message status: %v", err)
+			} else {
+				logger.Infof("Scheduled message ID %d sent successfully", msg.ID)
+			}
+		} else {
+			err = messageStore.UpdateScheduledMessageStatus(msg.ID, "failed", resultMsg)
+			if err != nil {
+				logger.Warnf("Failed to update scheduled message status: %v", err)
+			} else {
+				logger.Warnf("Scheduled message ID %d failed: %s", msg.ID, resultMsg)
+			}
+		}
+	}
 }
 
 // Function to send a WhatsApp message
@@ -426,6 +915,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
+	// Check for bot commands (messages from self starting with !)
+	if content != "" && handleBotCommand(client, messageStore, chatJID, content, msg.Info.IsFromMe, logger) {
+		// Command was handled, still store it but don't process further
+		logger.Infof("Bot command processed: %s", content)
+	}
+
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
@@ -466,6 +961,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		}
+
+		// Check if this channel is being watched and send webhook
+		if messageStore.IsChannelWatched(chatJID) {
+			sendWebhookNotification(chatJID, name, msg.Info.ID, sender, content, msg.Info.IsFromMe, mediaType, filename, logger)
 		}
 	}
 }
@@ -641,7 +1141,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +1274,363 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for scheduling messages
+	http.HandleFunc("/api/schedule", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodPost:
+			// Schedule a new message
+			var req ScheduleMessageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Invalid request format",
+				})
+				return
+			}
+
+			// Validate request
+			if req.Recipient == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Recipient is required",
+				})
+				return
+			}
+
+			if req.Message == "" && req.MediaPath == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Message or media path is required",
+				})
+				return
+			}
+
+			if req.ScheduledTime == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Scheduled time is required",
+				})
+				return
+			}
+
+			// Parse scheduled time (ISO 8601 format)
+			scheduledTime, err := time.Parse(time.RFC3339, req.ScheduledTime)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Invalid scheduled_time format. Use ISO 8601 (RFC3339): %v", err),
+				})
+				return
+			}
+
+			// Check if scheduled time is in the future
+			if scheduledTime.Before(time.Now()) {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Scheduled time must be in the future",
+				})
+				return
+			}
+
+			// Store scheduled message
+			id, err := messageStore.StoreScheduledMessage(req.Recipient, req.Message, req.MediaPath, scheduledTime)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to schedule message: %v", err),
+				})
+				return
+			}
+
+			// Get the created message
+			msg, _ := messageStore.GetScheduledMessage(id)
+
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: true,
+				Message: fmt.Sprintf("Message scheduled for %s", scheduledTime.Format(time.RFC3339)),
+				ID:      id,
+				Data:    msg,
+			})
+
+		case http.MethodGet:
+			// List scheduled messages
+			status := r.URL.Query().Get("status")
+			messages, err := messageStore.GetScheduledMessages(status)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to get scheduled messages: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"data":    messages,
+				"count":   len(messages),
+			})
+
+		case http.MethodDelete:
+			// Delete a scheduled message (requires id query param)
+			idStr := r.URL.Query().Get("id")
+			if idStr == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Message ID is required",
+				})
+				return
+			}
+
+			id, err := strconv.ParseInt(idStr, 10, 64)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: "Invalid message ID",
+				})
+				return
+			}
+
+			err = messageStore.DeleteScheduledMessage(id)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(ScheduleMessageResponse{
+					Success: false,
+					Message: err.Error(),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: true,
+				Message: "Scheduled message cancelled",
+				ID:      id,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Method not allowed",
+			})
+		}
+	})
+
+	// Webhook handler for external scheduling triggers
+	http.HandleFunc("/api/webhook/schedule", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Method not allowed",
+			})
+			return
+		}
+
+		var req ScheduleMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Invalid request format",
+			})
+			return
+		}
+
+		// Validate request
+		if req.Recipient == "" || (req.Message == "" && req.MediaPath == "") {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: "Recipient and message/media_path are required",
+			})
+			return
+		}
+
+		// If no scheduled time provided, send immediately
+		if req.ScheduledTime == "" {
+			success, resultMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: success,
+				Message: resultMsg,
+			})
+			return
+		}
+
+		// Parse and schedule for later
+		scheduledTime, err := time.Parse(time.RFC3339, req.ScheduledTime)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Invalid scheduled_time format: %v", err),
+			})
+			return
+		}
+
+		// If scheduled time is in the past or within 30 seconds, send immediately
+		if time.Until(scheduledTime) < 30*time.Second {
+			success, resultMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+			if !success {
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: success,
+				Message: resultMsg,
+			})
+			return
+		}
+
+		// Schedule for later
+		id, err := messageStore.StoreScheduledMessage(req.Recipient, req.Message, req.MediaPath, scheduledTime)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ScheduleMessageResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to schedule: %v", err),
+			})
+			return
+		}
+
+		msg, _ := messageStore.GetScheduledMessage(id)
+		json.NewEncoder(w).Encode(ScheduleMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Scheduled for %s", scheduledTime.Format(time.RFC3339)),
+			ID:      id,
+			Data:    msg,
+		})
+	})
+
+	// Handler for managing watched channels
+	http.HandleFunc("/api/watch", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method {
+		case http.MethodPost:
+			// Add a channel to watch list
+			var req struct {
+				JID  string `json:"jid"`
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.JID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "JID is required",
+				})
+				return
+			}
+
+			// If no name provided, try to get it from the database
+			name := req.Name
+			if name == "" {
+				var dbName string
+				err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", req.JID).Scan(&dbName)
+				if err == nil && dbName != "" {
+					name = dbName
+				} else {
+					name = req.JID
+				}
+			}
+
+			err := messageStore.AddWatchedChannel(req.JID, name)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to add watched channel: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": fmt.Sprintf("Now watching channel: %s", name),
+				"jid":     req.JID,
+				"name":    name,
+			})
+
+		case http.MethodGet:
+			// List all watched channels
+			channels, err := messageStore.GetWatchedChannels()
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to get watched channels: %v", err),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":     true,
+				"channels":    channels,
+				"count":       len(channels),
+				"webhook_url": getWebhookURL(),
+			})
+
+		case http.MethodDelete:
+			// Remove a channel from watch list
+			jid := r.URL.Query().Get("jid")
+			if jid == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "JID query parameter is required",
+				})
+				return
+			}
+
+			err := messageStore.RemoveWatchedChannel(jid)
+			if err != nil {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": err.Error(),
+				})
+				return
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"message": "Channel removed from watch list",
+				"jid":     jid,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +1657,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -908,11 +1765,14 @@ func main() {
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
+	// Start message scheduler
+	startScheduler(client, messageStore, logger)
+
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
 
-	fmt.Println("REST server is running. Press Ctrl+C to disconnect and exit.")
+	fmt.Println("REST server and scheduler are running. Press Ctrl+C to disconnect and exit.")
 
 	// Wait for termination signal
 	<-exitChan
@@ -973,7 +1833,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1848,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
