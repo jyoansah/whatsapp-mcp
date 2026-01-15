@@ -37,8 +37,39 @@ Claude ←→ MCP Server (Python/stdio) ←→ SQLite DB ←→ Go Bridge ←→
 
 **Key files:**
 - `whatsapp-bridge/main.go` - WhatsApp connection, message handlers, REST API, scheduler, channel watcher
-- `whatsapp-mcp-server/main.py` - MCP tool definitions (18 tools including scheduling and watching)
+- `whatsapp-mcp-server/main.py` - MCP tool definitions (20 tools including scheduling, watching, replies, and archiving)
 - `whatsapp-mcp-server/whatsapp.py` - Data access layer, SQLite queries, REST client
+
+## Message Replies
+
+Messages include reply context when they are replies to other messages. When viewing messages, reply information is displayed inline.
+
+**MCP Tools:**
+- `send_reply(recipient, message, reply_to_id, reply_to_jid)` - Send a message as a reply to a specific message
+
+**Message fields for replies:**
+- `reply_to_id` - ID of the message being replied to
+- `reply_to_sender` - JID of the sender of the original message
+- `reply_to_content` - Content snippet of the original message (truncated to 100 chars)
+
+**REST Endpoint:**
+- `POST /api/send` - Send message with optional reply support
+
+**Request format (with reply):**
+```json
+{
+  "recipient": "1234567890@s.whatsapp.net",
+  "message": "This is my reply!",
+  "reply_to_id": "ABC123DEF456",
+  "reply_to_jid": "9876543210@s.whatsapp.net"
+}
+```
+
+**How to get reply parameters:**
+1. Use `list_messages()` or `get_message_context()` to find the message you want to reply to
+2. Extract the message's `id` field for `reply_to_id`
+3. Extract the message's `sender` field and append `@s.whatsapp.net` for `reply_to_jid`
+4. Use the chat's `jid` as the `recipient`
 
 ## Message Scheduling
 
@@ -113,6 +144,36 @@ export WHATSAPP_WEBHOOK_URL="https://your-n8n-instance.com/webhook/whatsapp"
 | `!watchlist` | List all watched channels |
 | `!help` | Show available commands |
 
+## Chat Archiving
+
+Archive or unarchive WhatsApp chats to hide them from the main chat list.
+
+**MCP Tools:**
+- `archive_chat(jid, archive=True)` - Archive or unarchive a chat
+
+**REST Endpoint:**
+- `POST /api/archive` - Archive or unarchive a chat
+
+**Request format:**
+```json
+{
+  "jid": "1234567890@s.whatsapp.net",
+  "archive": true
+}
+```
+
+**Response format:**
+```json
+{
+  "success": true,
+  "message": "Chat archived successfully",
+  "jid": "1234567890@s.whatsapp.net",
+  "archive": true
+}
+```
+
+**Note:** Archiving a chat will automatically unpin it if it was pinned.
+
 ## MCP Configuration
 
 Add to Claude Desktop config:
@@ -126,6 +187,42 @@ Add to Claude Desktop config:
   }
 }
 ```
+
+## Media Download
+
+Downloaded media files are stored in `whatsapp-bridge/store/<chat_jid>/` and can be accessed via:
+
+1. **Local file path** - Returned in the `path` field (useful when running locally)
+2. **Public URL** - Returned in the `public_url` field (useful when running in Docker or remotely)
+
+**Environment Variable:**
+```bash
+export WHATSAPP_PUBLIC_URL="https://mcp.mini.jyoansah.me"
+```
+
+When set, the bridge will return a `public_url` that can be accessed externally. Without this variable, the URL defaults to `http://localhost:8080`.
+
+**MCP Tool:**
+- `download_media(message_id, chat_jid)` - Download media and get access URLs
+
+**REST Endpoints:**
+- `POST /api/download` - Download media, returns path and URL
+- `GET /api/media/<chat_jid>/<filename>` - Serve downloaded media file
+
+**Response format:**
+```json
+{
+  "success": true,
+  "message": "Successfully downloaded image media",
+  "filename": "image_20240101_120000.jpg",
+  "path": "/app/store/1234567890@s.whatsapp.net/image_20240101_120000.jpg",
+  "public_url": "https://mcp.mini.jyoansah.me/api/media/1234567890@s.whatsapp.net/image_20240101_120000.jpg",
+  "media_type": "image",
+  "access_note": "Media is accessible at the public_url. You can fetch it directly using: curl 'https://mcp.mini.jyoansah.me/api/media/...'"
+}
+```
+
+The `public_url` is the full URL for external access. The `access_note` provides instructions for how to retrieve the media file.
 
 ## Technical Notes
 

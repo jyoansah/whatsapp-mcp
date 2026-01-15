@@ -10,6 +10,7 @@ from whatsapp import (
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
+    send_reply as whatsapp_send_reply,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
@@ -18,7 +19,8 @@ from whatsapp import (
     cancel_scheduled_message as whatsapp_cancel_scheduled_message,
     watch_channel as whatsapp_watch_channel,
     unwatch_channel as whatsapp_unwatch_channel,
-    list_watched_channels as whatsapp_list_watched_channels
+    list_watched_channels as whatsapp_list_watched_channels,
+    archive_chat as whatsapp_archive_chat
 )
 
 # Initialize FastMCP server
@@ -190,6 +192,46 @@ def send_message(
     }
 
 @mcp.tool()
+def send_reply(
+    recipient: str,
+    message: str,
+    reply_to_id: str,
+    reply_to_jid: str
+) -> Dict[str, Any]:
+    """Send a WhatsApp message as a reply to a specific message.
+
+    Args:
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
+        message: The message text to send
+        reply_to_id: The ID of the message being replied to (from the message's 'id' field)
+        reply_to_jid: The JID of the sender of the message being replied to (from the message's 'sender' field,
+                     should be in format "123456789@s.whatsapp.net")
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    # Validate input
+    if not recipient:
+        return {
+            "success": False,
+            "message": "Recipient must be provided"
+        }
+
+    if not reply_to_id:
+        return {
+            "success": False,
+            "message": "reply_to_id must be provided"
+        }
+
+    # Call the whatsapp_send_reply function
+    success, status_message = whatsapp_send_reply(recipient, message, reply_to_id, reply_to_jid)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -238,19 +280,8 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
     Returns:
         A dictionary containing success status, a status message, and the file path if successful
     """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-
-    if file_path:
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": file_path
-        }
-    else:
-        return {
-            "success": False,
-            "message": "Failed to download media"
-        }
+    result = whatsapp_download_media(message_id, chat_jid)
+    return result
 
 @mcp.tool()
 def schedule_message(
@@ -387,6 +418,29 @@ def list_watched_channels() -> Dict[str, Any]:
         "channels": result.get("channels", []),
         "count": result.get("count", 0),
         "webhook_url": result.get("webhook_url", "")
+    }
+
+@mcp.tool()
+def archive_chat(jid: str, archive: bool = True) -> Dict[str, Any]:
+    """Archive or unarchive a WhatsApp chat. Archiving a chat will hide it from the main chat list. Note: Archiving a chat will also unpin it if it was pinned.
+
+    Args:
+        jid: The JID of the chat to archive/unarchive (e.g., "123456789@s.whatsapp.net" or group JID like "123456789@g.us")
+        archive: True to archive the chat, False to unarchive (default True)
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not jid:
+        return {
+            "success": False,
+            "message": "JID must be provided"
+        }
+
+    success, status_message = whatsapp_archive_chat(jid, archive)
+    return {
+        "success": success,
+        "message": status_message
     }
 
 if __name__ == "__main__":

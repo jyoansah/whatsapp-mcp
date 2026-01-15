@@ -22,6 +22,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -80,6 +81,9 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			reply_to_id TEXT,
+			reply_to_sender TEXT,
+			reply_to_content TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -107,7 +111,33 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	// Run migrations for existing databases
+	store := &MessageStore{db: db}
+	store.runMigrations()
+
+	return store, nil
+}
+
+// Run database migrations for schema updates
+func (store *MessageStore) runMigrations() {
+	// Add reply columns if they don't exist
+	columns := []string{"reply_to_id", "reply_to_sender", "reply_to_content"}
+	for _, col := range columns {
+		// Check if column exists
+		var count int
+		err := store.db.QueryRow(
+			"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = ?", col,
+		).Scan(&count)
+		if err != nil || count == 0 {
+			// Column doesn't exist, add it
+			_, err = store.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s TEXT", col))
+			if err != nil {
+				fmt.Printf("Warning: Could not add column %s: %v\n", col, err)
+			} else {
+				fmt.Printf("Added column %s to messages table\n", col)
+			}
+		}
+	}
 }
 
 // Close the database connection
@@ -126,17 +156,18 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	replyToID, replyToSender, replyToContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, replyToID, replyToSender, replyToContent,
 	)
 	return err
 }
@@ -214,9 +245,11 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient   string `json:"recipient"`
+	Message     string `json:"message"`
+	MediaPath   string `json:"media_path,omitempty"`
+	ReplyToID   string `json:"reply_to_id,omitempty"`
+	ReplyToJID  string `json:"reply_to_jid,omitempty"` // JID of the sender of the message being replied to
 }
 
 // ScheduledMessage represents a message scheduled for future delivery
@@ -470,6 +503,17 @@ func getWebhookURL() string {
 	return os.Getenv("WHATSAPP_WEBHOOK_URL")
 }
 
+// Get public base URL for external access (e.g., https://mcp.mini.jyoansah.me)
+// If not set, falls back to localhost:8080
+func getPublicBaseURL() string {
+	url := os.Getenv("WHATSAPP_PUBLIC_URL")
+	if url == "" {
+		return "http://localhost:8080"
+	}
+	// Remove trailing slash if present
+	return strings.TrimSuffix(url, "/")
+}
+
 // Send webhook notification for a watched channel message
 func sendWebhookNotification(chatJID, chatName, messageID, sender, content string, isFromMe bool, mediaType, filename string, logger waLog.Logger) {
 	webhookURL := getWebhookURL()
@@ -691,8 +735,13 @@ func processScheduledMessages(client *whatsmeow.Client, messageStore *MessageSto
 	}
 }
 
-// Function to send a WhatsApp message
+// Function to send a WhatsApp message (with optional reply support)
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+	return sendWhatsAppMessageWithReply(client, recipient, message, mediaPath, "", "")
+}
+
+// Function to send a WhatsApp message as a reply to another message
+func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToID string, replyToJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -719,6 +768,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	msg := &waProto.Message{}
+
+	// Create context info for replies
+	var contextInfo *waProto.ContextInfo
+	if replyToID != "" {
+		contextInfo = &waProto.ContextInfo{
+			StanzaID:    proto.String(replyToID),
+			Participant: proto.String(replyToJID),
+		}
+	}
 
 	// Check if we have media to send
 	if mediaPath != "" {
@@ -791,6 +849,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaAudio:
 			// Handle ogg audio files
@@ -821,6 +880,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				Seconds:       proto.Uint32(seconds),
 				PTT:           proto.Bool(true),
 				Waveform:      waveform,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaVideo:
 			msg.VideoMessage = &waProto.VideoMessage{
@@ -832,6 +892,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
@@ -844,10 +905,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileEncSHA256: resp.FileEncSHA256,
 				FileSHA256:    resp.FileSHA256,
 				FileLength:    &resp.FileLength,
+				ContextInfo:   contextInfo,
 			}
 		}
 	} else {
-		msg.Conversation = proto.String(message)
+		// For text messages, use ExtendedTextMessage if replying, otherwise Conversation
+		if contextInfo != nil {
+			msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+				Text:        proto.String(message),
+				ContextInfo: contextInfo,
+			}
+		} else {
+			msg.Conversation = proto.String(message)
+		}
 	}
 
 	// Send message
@@ -858,6 +928,60 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// Extract reply info from a message's ContextInfo
+func extractReplyInfo(msg *waProto.Message) (replyToID string, replyToSender string, replyToContent string) {
+	if msg == nil {
+		return "", "", ""
+	}
+
+	// Check different message types for ContextInfo
+	var contextInfo *waProto.ContextInfo
+
+	if ext := msg.GetExtendedTextMessage(); ext != nil {
+		contextInfo = ext.GetContextInfo()
+	} else if img := msg.GetImageMessage(); img != nil {
+		contextInfo = img.GetContextInfo()
+	} else if vid := msg.GetVideoMessage(); vid != nil {
+		contextInfo = vid.GetContextInfo()
+	} else if aud := msg.GetAudioMessage(); aud != nil {
+		contextInfo = aud.GetContextInfo()
+	} else if doc := msg.GetDocumentMessage(); doc != nil {
+		contextInfo = doc.GetContextInfo()
+	}
+
+	if contextInfo == nil {
+		return "", "", ""
+	}
+
+	replyToID = contextInfo.GetStanzaID()
+	replyToSender = contextInfo.GetParticipant()
+
+	// Extract content from quoted message
+	if quotedMsg := contextInfo.GetQuotedMessage(); quotedMsg != nil {
+		replyToContent = extractTextContent(quotedMsg)
+		// If no text content, check for media type
+		if replyToContent == "" {
+			if quotedMsg.GetImageMessage() != nil {
+				replyToContent = "[Image]"
+			} else if quotedMsg.GetVideoMessage() != nil {
+				replyToContent = "[Video]"
+			} else if quotedMsg.GetAudioMessage() != nil {
+				replyToContent = "[Audio]"
+			} else if quotedMsg.GetDocumentMessage() != nil {
+				replyToContent = "[Document]"
+			} else if quotedMsg.GetStickerMessage() != nil {
+				replyToContent = "[Sticker]"
+			}
+		}
+		// Truncate if too long
+		if len(replyToContent) > 100 {
+			replyToContent = replyToContent[:100] + "..."
+		}
+	}
+
+	return replyToID, replyToSender, replyToContent
 }
 
 // Extract media info from a message
@@ -924,6 +1048,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
+	// Extract reply info
+	replyToID, replyToSender, replyToContent := extractReplyInfo(msg.Message)
+
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
 		return
@@ -944,6 +1071,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		replyToID,
+		replyToSender,
+		replyToContent,
 	)
 
 	if err != nil {
@@ -978,10 +1108,14 @@ type DownloadMediaRequest struct {
 
 // DownloadMediaResponse represents the response for the download media API
 type DownloadMediaResponse struct {
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
-	Filename string `json:"filename,omitempty"`
-	Path     string `json:"path,omitempty"`
+	Success       bool   `json:"success"`
+	Message       string `json:"message"`
+	Filename      string `json:"filename,omitempty"`
+	Path          string `json:"path,omitempty"`
+	MediaURL      string `json:"media_url,omitempty"`       // Relative URL path (e.g., /api/media/...)
+	PublicURL     string `json:"public_url,omitempty"`      // Full public URL for external access
+	MediaType     string `json:"media_type,omitempty"`
+	AccessNote    string `json:"access_note,omitempty"`     // Instructions for accessing the media
 }
 
 // Store additional media info in the database
@@ -1203,10 +1337,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		fmt.Println("Received request to send message", req.Message, req.MediaPath, "reply_to:", req.ReplyToID)
 
-		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		// Send the message (with optional reply support)
+		success, message := sendWhatsAppMessageWithReply(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToID, req.ReplyToJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -1265,13 +1399,97 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		// Generate URL path for the media file
+		// The path is relative to "store/", so we extract that part
+		// Path format: /abs/path/to/store/<chat_jid>/<filename>
+		// We need to construct URL as /api/media/<chat_jid>/<filename>
+		chatDirSafe := strings.ReplaceAll(req.ChatJID, ":", "_")
+		mediaURL := fmt.Sprintf("/api/media/%s/%s", chatDirSafe, filename)
+
+		// Get public base URL and construct full public URL
+		publicBaseURL := getPublicBaseURL()
+		publicURL := publicBaseURL + mediaURL
+
+		// Generate access note based on whether public URL is configured
+		var accessNote string
+		if os.Getenv("WHATSAPP_PUBLIC_URL") != "" {
+			accessNote = fmt.Sprintf("Media is accessible at the public_url. You can fetch it directly using: curl '%s'", publicURL)
+		} else {
+			accessNote = fmt.Sprintf("Media is stored locally at: %s. For remote access, set WHATSAPP_PUBLIC_URL environment variable.", path)
+		}
+
 		// Send successful response
 		json.NewEncoder(w).Encode(DownloadMediaResponse{
-			Success:  true,
-			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
-			Filename: filename,
-			Path:     path,
+			Success:    true,
+			Message:    fmt.Sprintf("Successfully downloaded %s media", mediaType),
+			Filename:   filename,
+			Path:       path,
+			MediaURL:   mediaURL,
+			PublicURL:  publicURL,
+			MediaType:  mediaType,
+			AccessNote: accessNote,
 		})
+	})
+
+	// Handler for serving media files via HTTP
+	http.HandleFunc("/api/media/", func(w http.ResponseWriter, r *http.Request) {
+		// Only allow GET requests
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract the path after /api/media/
+		// Expected format: /api/media/<chat_jid>/<filename>
+		pathParts := strings.TrimPrefix(r.URL.Path, "/api/media/")
+		if pathParts == "" {
+			http.Error(w, "Invalid media path", http.StatusBadRequest)
+			return
+		}
+
+		// Security: prevent path traversal attacks
+		if strings.Contains(pathParts, "..") {
+			http.Error(w, "Invalid path", http.StatusBadRequest)
+			return
+		}
+
+		// Construct the full file path
+		filePath := filepath.Join("store", pathParts)
+
+		// Check if file exists
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+
+		// Determine content type based on file extension
+		ext := strings.ToLower(filepath.Ext(filePath))
+		contentType := "application/octet-stream"
+		switch ext {
+		case ".jpg", ".jpeg":
+			contentType = "image/jpeg"
+		case ".png":
+			contentType = "image/png"
+		case ".gif":
+			contentType = "image/gif"
+		case ".webp":
+			contentType = "image/webp"
+		case ".mp4":
+			contentType = "video/mp4"
+		case ".avi":
+			contentType = "video/avi"
+		case ".mov":
+			contentType = "video/quicktime"
+		case ".ogg":
+			contentType = "audio/ogg"
+		case ".mp3":
+			contentType = "audio/mpeg"
+		case ".pdf":
+			contentType = "application/pdf"
+		}
+
+		w.Header().Set("Content-Type", contentType)
+		http.ServeFile(w, r, filePath)
 	})
 
 	// Handler for scheduling messages
@@ -1514,6 +1732,87 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message: fmt.Sprintf("Scheduled for %s", scheduledTime.Format(time.RFC3339)),
 			ID:      id,
 			Data:    msg,
+		})
+	})
+
+	// Handler for archiving/unarchiving chats
+	http.HandleFunc("/api/archive", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+			return
+		}
+
+		var req struct {
+			JID     string `json:"jid"`
+			Archive bool   `json:"archive"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Invalid request format",
+			})
+			return
+		}
+
+		if req.JID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID is required",
+			})
+			return
+		}
+
+		// Parse the JID
+		targetJID, err := types.ParseJID(req.JID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Invalid JID: %v", err),
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Build and send the archive app state patch
+		patch := appstate.BuildArchive(targetJID, req.Archive, time.Time{}, nil)
+		err = client.SendAppState(context.Background(), patch)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to archive chat: %v", err),
+			})
+			return
+		}
+
+		action := "archived"
+		if !req.Archive {
+			action = "unarchived"
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"message": fmt.Sprintf("Chat %s successfully", action),
+			"jid":     req.JID,
+			"archive": req.Archive,
 		})
 	})
 
@@ -1932,6 +2231,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
+				// Extract reply info
+				var replyToID, replyToSender, replyToContent string
+				if msg.Message.Message != nil {
+					replyToID, replyToSender, replyToContent = extractReplyInfo(msg.Message.Message)
+				}
+
 				// Log the message content for debugging
 				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
 
@@ -1986,6 +2291,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					replyToID,
+					replyToSender,
+					replyToContent,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
