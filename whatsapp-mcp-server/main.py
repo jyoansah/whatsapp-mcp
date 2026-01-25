@@ -232,20 +232,27 @@ def send_reply(
     }
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
+def send_file(recipient: str, media_path: str = "", media_data: str = "", filename: str = "") -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
+    Supports multiple ways to provide the file:
+    - media_data (preferred): Base64-encoded file data - use this for local files
+    - media_path with URL: Remote URL (http:// or https://) to download and send
+    - media_path with path: Container-accessible path (only works for mounted volumes)
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
+        media_path: Either a URL to download, or a container-accessible file path
+        media_data: Base64-encoded file data (preferred for local files). Takes priority over media_path.
+        filename: Original filename (required when using media_data, e.g., "image.png")
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
+
     # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
+    success, status_message = whatsapp_send_file(recipient, media_path, media_data, filename)
     return {
         "success": success,
         "message": status_message
@@ -254,12 +261,16 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+
+    Supports both local file paths and remote URLs:
+    - Local paths: Will be converted to Opus OGG format if needed (requires ffmpeg)
+    - URLs (http:// or https://): File should already be in OGG Opus format for voice messages
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+        media_path: Either an absolute path to the audio file, or a URL to download and send
+
     Returns:
         A dictionary containing success status and a status message
     """

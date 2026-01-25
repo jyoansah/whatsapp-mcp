@@ -224,6 +224,32 @@ When set, the bridge will return a `public_url` that can be accessed externally.
 
 The `public_url` is the full URL for external access. The `access_note` provides instructions for how to retrieve the media file.
 
+## Sending Files
+
+The `send_file` and `send_audio_message` MCP tools support both local file paths and remote URLs:
+
+**Local file paths:**
+- The Go bridge reads files directly from the local filesystem
+- Example: `/Users/john/Documents/image.png`
+
+**Remote URLs:**
+- The Go bridge downloads and sends files from HTTP/HTTPS URLs
+- Example: `https://example.com/photo.jpg`
+
+**REST API format:**
+```json
+{
+  "recipient": "1234567890@s.whatsapp.net",
+  "message": "Optional caption",
+  "media_path": "/local/path/to/file.jpg",
+  "media_url": "https://example.com/file.jpg",
+  "media_data": "base64encodeddata...",
+  "filename": "custom_filename.jpg"
+}
+```
+
+Priority: `media_data` > `media_url` > `media_path` (first non-empty wins)
+
 ## Technical Notes
 
 - Python 3.11+ required
@@ -231,3 +257,13 @@ The `public_url` is the full URL for external access. The `access_note` provides
 - Windows builds need CGO enabled for go-sqlite3
 - Go bridge must authenticate via QR code on first run (scan with WhatsApp mobile app)
 - Messages DB path: `../whatsapp-bridge/store/messages.db` (relative to MCP server)
+- WhatsApp contacts DB path: `../whatsapp-bridge/store/whatsapp.db` (whatsmeow stores contacts here)
+
+## Contact Name Resolution
+
+The MCP server resolves contact names in this priority order:
+1. **whatsmeow contacts table** (`whatsapp.db`) - Contains `full_name`, `push_name`, and `business_name` synced from WhatsApp
+2. **chats table** (`messages.db`) - Contains chat names stored by the Go bridge
+3. **Phone number fallback** - If no name found, displays the phone number from the JID
+
+Contact name lookups are cached in memory to avoid repeated database queries.

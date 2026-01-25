@@ -8,7 +8,11 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSMEOW_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+# Cache for contact names to avoid repeated database lookups
+_contact_name_cache = {}
 
 @dataclass
 class Message:
@@ -50,11 +54,93 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+def get_contact_name_from_whatsmeow(jid: str) -> Optional[str]:
+    """Get contact name from whatsmeow contacts table.
+
+    Args:
+        jid: The JID to look up (e.g., "233551749015@s.whatsapp.net" or "233551749015")
+
+    Returns:
+        The contact's display name (full_name, push_name, or business_name), or None if not found
+    """
+    global _contact_name_cache
+
+    # Normalize JID - ensure it has the @s.whatsapp.net suffix for individual contacts
+    normalized_jid = jid
+    if '@' not in jid:
+        normalized_jid = f"{jid}@s.whatsapp.net"
+
+    # Check cache first
+    if normalized_jid in _contact_name_cache:
+        return _contact_name_cache[normalized_jid]
+
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+
+        # Query whatsmeow_contacts table for the contact name
+        # Priority: full_name > push_name > business_name
+        cursor.execute("""
+            SELECT full_name, push_name, business_name
+            FROM whatsmeow_contacts
+            WHERE their_jid = ?
+            LIMIT 1
+        """, (normalized_jid,))
+
+        result = cursor.fetchone()
+
+        if result:
+            full_name, push_name, business_name = result
+            # Return the first non-empty name
+            name = full_name or push_name or business_name
+            if name:
+                _contact_name_cache[normalized_jid] = name
+                return name
+
+        # Also try without the suffix (in case JID format varies)
+        if '@' in jid:
+            phone_part = jid.split('@')[0]
+            cursor.execute("""
+                SELECT full_name, push_name, business_name
+                FROM whatsmeow_contacts
+                WHERE their_jid LIKE ?
+                LIMIT 1
+            """, (f"{phone_part}@%",))
+
+            result = cursor.fetchone()
+            if result:
+                full_name, push_name, business_name = result
+                name = full_name or push_name or business_name
+                if name:
+                    _contact_name_cache[normalized_jid] = name
+                    return name
+
+        # Cache the miss as None
+        _contact_name_cache[normalized_jid] = None
+        return None
+
+    except sqlite3.Error as e:
+        print(f"Database error while getting contact name from whatsmeow: {e}")
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
 def get_sender_name(sender_jid: str) -> str:
+    """Get display name for a sender JID.
+
+    Looks up contact name from whatsmeow contacts first, then falls back to chats table.
+    """
+    # First try to get contact name from whatsmeow contacts
+    contact_name = get_contact_name_from_whatsmeow(sender_jid)
+    if contact_name:
+        return contact_name
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # First try matching by exact JID
         cursor.execute("""
             SELECT name
@@ -62,9 +148,9 @@ def get_sender_name(sender_jid: str) -> str:
             WHERE jid = ?
             LIMIT 1
         """, (sender_jid,))
-        
+
         result = cursor.fetchone()
-        
+
         # If no result, try looking for the number within JIDs
         if not result:
             # Extract the phone number part if it's a JID
@@ -72,21 +158,24 @@ def get_sender_name(sender_jid: str) -> str:
                 phone_part = sender_jid.split('@')[0]
             else:
                 phone_part = sender_jid
-                
+
             cursor.execute("""
                 SELECT name
                 FROM chats
                 WHERE jid LIKE ?
                 LIMIT 1
             """, (f"%{phone_part}%",))
-            
+
             result = cursor.fetchone()
-        
+
         if result and result[0]:
             return result[0]
         else:
+            # Return just the phone number part if we have a JID
+            if '@' in sender_jid:
+                return sender_jid.split('@')[0]
             return sender_jid
-        
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -394,18 +483,30 @@ def list_chats(
         
         result = []
         for chat_data in chats:
+            jid = chat_data[0]
+            name = chat_data[1]
+
+            # For individual chats (not groups), try to get contact name from whatsmeow
+            if not jid.endswith("@g.us"):
+                contact_name = get_contact_name_from_whatsmeow(jid)
+                if contact_name:
+                    name = contact_name
+                elif not name:
+                    # If no name found anywhere, use phone number
+                    name = jid.split('@')[0] if '@' in jid else jid
+
             chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
+                jid=jid,
+                name=name,
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -415,45 +516,103 @@ def list_chats(
 
 
 def search_contacts(query: str) -> List[Contact]:
-    """Search contacts by name or phone number."""
+    """Search contacts by name or phone number.
+
+    Searches both the chats table and whatsmeow contacts for matching contacts.
+    """
+    result = []
+    seen_jids = set()
+
+    # First, search whatsmeow contacts (more accurate names)
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+
+        search_pattern = f'%{query}%'
+
+        cursor.execute("""
+            SELECT DISTINCT
+                their_jid,
+                full_name,
+                push_name,
+                business_name
+            FROM whatsmeow_contacts
+            WHERE
+                (LOWER(full_name) LIKE LOWER(?) OR
+                 LOWER(push_name) LIKE LOWER(?) OR
+                 LOWER(business_name) LIKE LOWER(?) OR
+                 their_jid LIKE ?)
+                AND their_jid NOT LIKE '%@g.us'
+            ORDER BY full_name, push_name, their_jid
+            LIMIT 50
+        """, (search_pattern, search_pattern, search_pattern, search_pattern))
+
+        contacts = cursor.fetchall()
+
+        for contact_data in contacts:
+            jid = contact_data[0]
+            full_name, push_name, business_name = contact_data[1], contact_data[2], contact_data[3]
+            name = full_name or push_name or business_name
+
+            if jid not in seen_jids:
+                contact = Contact(
+                    phone_number=jid.split('@')[0] if '@' in jid else jid,
+                    name=name,
+                    jid=jid
+                )
+                result.append(contact)
+                seen_jids.add(jid)
+
+    except sqlite3.Error as e:
+        print(f"Database error while searching whatsmeow contacts: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    # Then search chats table for any additional contacts
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        search_pattern = f'%{query}%'
+
         cursor.execute("""
-            SELECT DISTINCT 
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
+            WHERE
                 (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
         """, (search_pattern, search_pattern))
-        
+
         contacts = cursor.fetchall()
-        
-        result = []
+
         for contact_data in contacts:
-            contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
-                jid=contact_data[0]
-            )
-            result.append(contact)
-            
-        return result
-        
+            jid = contact_data[0]
+            if jid not in seen_jids:
+                # Try to get contact name from whatsmeow first
+                name = get_contact_name_from_whatsmeow(jid) or contact_data[1]
+                if not name:
+                    name = jid.split('@')[0] if '@' in jid else jid
+
+                contact = Contact(
+                    phone_number=jid.split('@')[0] if '@' in jid else jid,
+                    name=name,
+                    jid=jid
+                )
+                result.append(contact)
+                seen_jids.add(jid)
+
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        print(f"Database error while searching chats: {e}")
     finally:
         if 'conn' in locals():
             conn.close()
+
+    return result
 
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
@@ -484,21 +643,32 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         """, (jid, jid, limit, page * limit))
         
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
+            chat_jid = chat_data[0]
+            name = chat_data[1]
+
+            # For individual chats (not groups), try to get contact name from whatsmeow
+            if not chat_jid.endswith("@g.us"):
+                contact_name = get_contact_name_from_whatsmeow(chat_jid)
+                if contact_name:
+                    name = contact_name
+                elif not name:
+                    name = chat_jid.split('@')[0] if '@' in chat_jid else chat_jid
+
             chat = Chat(
-                jid=chat_data[0],
-                name=chat_data[1],
+                jid=chat_jid,
+                name=name,
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
@@ -567,9 +737,9 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         query = """
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -578,30 +748,41 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
                 m.is_from_me as last_is_from_me
             FROM chats c
         """
-        
+
         if include_last_message:
             query += """
-                LEFT JOIN messages m ON c.jid = m.chat_jid 
+                LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             """
-            
+
         query += " WHERE c.jid = ?"
-        
+
         cursor.execute(query, (chat_jid,))
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
+        jid = chat_data[0]
+        name = chat_data[1]
+
+        # For individual chats (not groups), try to get contact name from whatsmeow
+        if not jid.endswith("@g.us"):
+            contact_name = get_contact_name_from_whatsmeow(jid)
+            if contact_name:
+                name = contact_name
+            elif not name:
+                name = jid.split('@')[0] if '@' in jid else jid
+
         return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
+            jid=jid,
+            name=name,
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
@@ -615,9 +796,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         cursor.execute("""
-            SELECT 
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -625,26 +806,36 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            LEFT JOIN messages m ON c.jid = m.chat_jid 
+            LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
-        
+
         chat_data = cursor.fetchone()
-        
+
         if not chat_data:
             return None
-            
+
+        jid = chat_data[0]
+        name = chat_data[1]
+
+        # Try to get contact name from whatsmeow
+        contact_name = get_contact_name_from_whatsmeow(jid)
+        if contact_name:
+            name = contact_name
+        elif not name:
+            name = jid.split('@')[0] if '@' in jid else jid
+
         return Chat(
-            jid=chat_data[0],
-            name=chat_data[1],
+            jid=jid,
+            name=name,
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5]
         )
-        
+
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return None
@@ -724,33 +915,66 @@ def send_reply(recipient: str, message: str, reply_to_id: str, reply_to_jid: str
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
-def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
+def send_file(recipient: str, media_path: str = "", media_data: str = "", filename: str = "") -> Tuple[bool, str]:
+    """Send a file via WhatsApp.
+
+    Priority order:
+    1. media_data (base64) - highest priority, best for local files
+    2. media_path with URL - for remote files
+    3. media_path with path - for container-accessible paths only
+
+    Args:
+        recipient: Phone number or JID
+        media_path: URL or container-accessible file path
+        media_data: Base64-encoded file data (takes priority)
+        filename: Original filename (required with media_data)
+
+    Returns:
+        Tuple of (success, message)
+    """
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
-        
+
+        if not media_path and not media_data:
+            return False, "Either media_path (URL or path) or media_data (base64) must be provided"
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "media_path": media_path
-        }
-        
+        payload = {"recipient": recipient}
+
+        # Priority: media_data > media_url > media_path
+        if media_data:
+            # Base64 data provided - highest priority
+            payload["media_data"] = media_data
+            if filename:
+                payload["filename"] = filename
+        elif media_path.startswith("http://") or media_path.startswith("https://"):
+            # It's a URL - send via media_url parameter
+            payload["media_url"] = media_path
+        else:
+            # It's a local path - check if accessible before sending
+            if not os.path.isfile(media_path):
+                # File not found - provide helpful guidance
+                return False, (
+                    f"Media file not found: {media_path}. "
+                    "This MCP runs in a container and cannot access host filesystem paths. "
+                    "Please use one of these alternatives:\n"
+                    "1. media_data: Pass base64-encoded file content (recommended)\n"
+                    "2. media_path with URL: Provide an http:// or https:// URL\n"
+                    "3. Container path: Use paths under /app/store/ (mounted volume)"
+                )
+            payload["media_path"] = media_path
+
         response = requests.post(url, json=payload)
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -759,38 +983,66 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    """Send an audio file as a WhatsApp voice message.
+
+    The media_path can be:
+    - A local file path (will be read by the Go bridge)
+    - A remote URL starting with http:// or https:// (will be downloaded by the Go bridge)
+
+    Note: For proper voice message display, the file should be in OGG Opus format.
+    For local files, this function can convert them using ffmpeg.
+    For URLs, ensure the file is already in OGG Opus format.
+
+    Args:
+        recipient: Phone number or JID
+        media_path: Local file path or remote URL
+
+    Returns:
+        Tuple of (success, message)
+    """
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
-        if not media_path:
-            return False, "Media path must be provided"
-        
-        if not os.path.isfile(media_path):
-            return False, f"Media file not found: {media_path}"
 
-        if not media_path.endswith(".ogg"):
-            try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
-            except Exception as e:
-                return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
+        if not media_path:
+            return False, "Media path or URL must be provided"
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {
-            "recipient": recipient,
-            "media_path": media_path
-        }
-        
+
+        # Check if media_path is a URL or a local path
+        if media_path.startswith("http://") or media_path.startswith("https://"):
+            # It's a URL - send via media_url parameter
+            # For URLs, we assume the file is already in the correct format
+            payload = {
+                "recipient": recipient,
+                "media_url": media_path
+            }
+        else:
+            # It's a local path
+            # Check if the file exists locally and can be converted
+            if os.path.isfile(media_path):
+                if not media_path.endswith(".ogg"):
+                    try:
+                        media_path = audio.convert_to_opus_ogg_temp(media_path)
+                    except Exception as e:
+                        return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
+
+            # Send via media_path parameter - Go bridge will read the file
+            payload = {
+                "recipient": recipient,
+                "media_path": media_path
+            }
+
         response = requests.post(url, json=payload)
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:

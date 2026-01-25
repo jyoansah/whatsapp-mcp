@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -247,7 +249,10 @@ type SendMessageResponse struct {
 type SendMessageRequest struct {
 	Recipient   string `json:"recipient"`
 	Message     string `json:"message"`
-	MediaPath   string `json:"media_path,omitempty"`
+	MediaPath   string `json:"media_path,omitempty"`   // Local file path (Go bridge will read it)
+	MediaURL    string `json:"media_url,omitempty"`    // Remote URL to download and send
+	MediaData   string `json:"media_data,omitempty"`   // Base64-encoded file data
+	Filename    string `json:"filename,omitempty"`     // Original filename (for media_data or media_url)
 	ReplyToID   string `json:"reply_to_id,omitempty"`
 	ReplyToJID  string `json:"reply_to_jid,omitempty"` // JID of the sender of the message being replied to
 }
@@ -735,13 +740,109 @@ func processScheduledMessages(client *whatsmeow.Client, messageStore *MessageSto
 	}
 }
 
+// MediaSource represents media to be sent (from various sources)
+type MediaSource struct {
+	Data     []byte
+	Filename string
+	MimeType string
+}
+
+// resolveMedia resolves media from path, URL, or base64 data
+// Returns the media data, filename, and any error
+func resolveMedia(mediaPath, mediaURL, mediaData, filename string) (*MediaSource, error) {
+	// Priority: mediaData > mediaURL > mediaPath
+
+	if mediaData != "" {
+		// Decode base64 data
+		data, err := base64.StdEncoding.DecodeString(mediaData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode base64 media data: %v", err)
+		}
+		if filename == "" {
+			filename = "file"
+		}
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	if mediaURL != "" {
+		// Download from URL
+		fmt.Printf("Downloading media from URL: %s\n", mediaURL)
+
+		// Create HTTP client with timeout
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Get(mediaURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download media from URL: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to download media: HTTP %d", resp.StatusCode)
+		}
+
+		// Read response body
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read media data: %v", err)
+		}
+
+		// Determine filename from URL or Content-Disposition header
+		if filename == "" {
+			// Try to get filename from Content-Disposition header
+			if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+				if idx := strings.Index(cd, "filename="); idx >= 0 {
+					fn := cd[idx+9:]
+					fn = strings.Trim(fn, "\"'")
+					if fn != "" {
+						filename = fn
+					}
+				}
+			}
+			// Fallback: extract from URL
+			if filename == "" {
+				urlParts := strings.Split(strings.Split(mediaURL, "?")[0], "/")
+				if len(urlParts) > 0 {
+					filename = urlParts[len(urlParts)-1]
+				}
+				if filename == "" {
+					filename = "downloaded_file"
+				}
+			}
+		}
+
+		fmt.Printf("Downloaded %d bytes, filename: %s\n", len(data), filename)
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	if mediaPath != "" {
+		// Read from local file path
+		data, err := os.ReadFile(mediaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read media file: %v", err)
+		}
+
+		// Extract filename from path
+		if filename == "" {
+			filename = filepath.Base(mediaPath)
+		}
+
+		return &MediaSource{Data: data, Filename: filename}, nil
+	}
+
+	return nil, nil // No media provided
+}
+
 // Function to send a WhatsApp message (with optional reply support)
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
-	return sendWhatsAppMessageWithReply(client, recipient, message, mediaPath, "", "")
+	return sendWhatsAppMessageWithReply(client, recipient, message, mediaPath, "", "", "", "", "")
 }
 
 // Function to send a WhatsApp message as a reply to another message
-func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, message string, mediaPath string, replyToID string, replyToJID string) (bool, string) {
+// mediaPath: local file path (for backward compatibility)
+// mediaURL: remote URL to download
+// mediaDataB64: base64-encoded file data
+// filename: optional filename for URL or base64 data
+func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, message string, mediaPath string, mediaURL string, mediaDataB64 string, filename string, replyToID string, replyToJID string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -778,16 +879,20 @@ func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, me
 		}
 	}
 
+	// Resolve media from various sources
+	media, err := resolveMedia(mediaPath, mediaURL, mediaDataB64, filename)
+	if err != nil {
+		return false, fmt.Sprintf("Error resolving media: %v", err)
+	}
+
 	// Check if we have media to send
-	if mediaPath != "" {
-		// Read media file
-		mediaData, err := os.ReadFile(mediaPath)
-		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+	if media != nil && len(media.Data) > 0 {
+		// Determine media type and mime type based on file extension
+		var fileExt string
+		if idx := strings.LastIndex(media.Filename, "."); idx >= 0 {
+			fileExt = strings.ToLower(media.Filename[idx+1:])
 		}
 
-		// Determine media type and mime type based on file extension
-		fileExt := strings.ToLower(mediaPath[strings.LastIndex(mediaPath, ".")+1:])
 		var mediaType whatsmeow.MediaType
 		var mimeType string
 
@@ -830,12 +935,12 @@ func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, me
 		}
 
 		// Upload media to WhatsApp servers
-		resp, err := client.Upload(context.Background(), mediaData, mediaType)
+		resp, err := client.Upload(context.Background(), media.Data, mediaType)
 		if err != nil {
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
+		fmt.Printf("Media uploaded: URL=%s, FileLength=%d\n", resp.URL, resp.FileLength)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -858,7 +963,7 @@ func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, me
 
 			// Try to analyze the ogg file
 			if strings.Contains(mimeType, "ogg") {
-				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(mediaData)
+				analyzedSeconds, analyzedWaveform, err := analyzeOggOpus(media.Data)
 				if err == nil {
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
@@ -896,7 +1001,7 @@ func sendWhatsAppMessageWithReply(client *whatsmeow.Client, recipient string, me
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(media.Filename),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -1332,15 +1437,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		if req.Message == "" && req.MediaPath == "" {
-			http.Error(w, "Message or media path is required", http.StatusBadRequest)
+		if req.Message == "" && req.MediaPath == "" && req.MediaURL == "" && req.MediaData == "" {
+			http.Error(w, "Message, media_path, media_url, or media_data is required", http.StatusBadRequest)
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath, "reply_to:", req.ReplyToID)
+		fmt.Println("Received request to send message", req.Message, "media_path:", req.MediaPath, "media_url:", req.MediaURL, "reply_to:", req.ReplyToID)
 
 		// Send the message (with optional reply support)
-		success, message := sendWhatsAppMessageWithReply(client, req.Recipient, req.Message, req.MediaPath, req.ReplyToID, req.ReplyToJID)
+		success, message := sendWhatsAppMessageWithReply(client, req.Recipient, req.Message, req.MediaPath, req.MediaURL, req.MediaData, req.Filename, req.ReplyToID, req.ReplyToJID)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
