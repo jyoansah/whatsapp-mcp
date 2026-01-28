@@ -20,7 +20,10 @@ from whatsapp import (
     watch_channel as whatsapp_watch_channel,
     unwatch_channel as whatsapp_unwatch_channel,
     list_watched_channels as whatsapp_list_watched_channels,
-    archive_chat as whatsapp_archive_chat
+    archive_chat as whatsapp_archive_chat,
+    get_group_info as whatsapp_get_group_info,
+    add_group_members as whatsapp_add_group_members,
+    remove_group_members as whatsapp_remove_group_members
 )
 
 # Initialize FastMCP server
@@ -453,6 +456,106 @@ def archive_chat(jid: str, archive: bool = True) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+
+@mcp.tool()
+def get_group_info(group_jid: str) -> Dict[str, Any]:
+    """Get information about a WhatsApp group including its members.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us, e.g., "123456789@g.us")
+
+    Returns:
+        A dictionary containing:
+        - success: Whether the request succeeded
+        - jid: The group JID
+        - name: The group name
+        - topic: The group description/topic
+        - owner_jid: JID of the group owner
+        - participants: List of group members with their JID, name, is_admin, and is_super_admin status
+        - participant_count: Number of participants
+    """
+    if not group_jid:
+        return {
+            "success": False,
+            "message": "group_jid must be provided"
+        }
+
+    if not group_jid.endswith("@g.us"):
+        return {
+            "success": False,
+            "message": "group_jid must be a group JID (ending with @g.us)"
+        }
+
+    result = whatsapp_get_group_info(group_jid)
+    return result
+
+
+@mcp.tool()
+def add_group_member(group_jid: str, participant: str) -> Dict[str, Any]:
+    """Add a contact to a WhatsApp group. You must be an admin of the group to add members.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us, e.g., "123456789@g.us")
+        participant: The phone number (with country code, no + or symbols) or JID of the contact to add
+
+    Returns:
+        A dictionary containing success status, message, and results for the participant
+    """
+    if not group_jid:
+        return {
+            "success": False,
+            "message": "group_jid must be provided"
+        }
+
+    if not group_jid.endswith("@g.us"):
+        return {
+            "success": False,
+            "message": "group_jid must be a group JID (ending with @g.us)"
+        }
+
+    if not participant:
+        return {
+            "success": False,
+            "message": "participant must be provided"
+        }
+
+    result = whatsapp_add_group_members(group_jid, [participant])
+    return result
+
+
+@mcp.tool()
+def remove_group_member(group_jid: str, participant: str) -> Dict[str, Any]:
+    """Remove a contact from a WhatsApp group. You must be an admin of the group to remove members.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us, e.g., "123456789@g.us")
+        participant: The phone number (with country code, no + or symbols) or JID of the contact to remove
+
+    Returns:
+        A dictionary containing success status, message, and results for the participant
+    """
+    if not group_jid:
+        return {
+            "success": False,
+            "message": "group_jid must be provided"
+        }
+
+    if not group_jid.endswith("@g.us"):
+        return {
+            "success": False,
+            "message": "group_jid must be a group JID (ending with @g.us)"
+        }
+
+    if not participant:
+        return {
+            "success": False,
+            "message": "participant must be provided"
+        }
+
+    result = whatsapp_remove_group_members(group_jid, [participant])
+    return result
+
 
 if __name__ == "__main__":
     import os

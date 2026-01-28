@@ -174,6 +174,76 @@ Archive or unarchive WhatsApp chats to hide them from the main chat list.
 
 **Note:** Archiving a chat will automatically unpin it if it was pinned.
 
+## Group Member Management
+
+Manage members in WhatsApp groups. You must be an admin of the group to add or remove members.
+
+**MCP Tools:**
+- `get_group_info(group_jid)` - Get group information including member list
+- `add_group_member(group_jid, participant)` - Add a contact to a group
+- `remove_group_member(group_jid, participant)` - Remove a contact from a group
+
+**REST Endpoints:**
+- `GET /api/group?jid=<group_jid>` - Get group info and members
+- `POST /api/group/members` - Add members to a group
+- `DELETE /api/group/members` - Remove members from a group
+
+**Get Group Info Request:**
+```
+GET /api/group?jid=123456789@g.us
+```
+
+**Get Group Info Response:**
+```json
+{
+  "success": true,
+  "jid": "123456789@g.us",
+  "name": "My Group",
+  "topic": "Group description",
+  "owner_jid": "1234567890@s.whatsapp.net",
+  "created_at": "2024-01-01T00:00:00Z",
+  "participants": [
+    {
+      "jid": "1234567890@s.whatsapp.net",
+      "name": "John Doe",
+      "is_admin": true,
+      "is_super_admin": true
+    },
+    {
+      "jid": "0987654321@s.whatsapp.net",
+      "name": "Jane Smith",
+      "is_admin": false,
+      "is_super_admin": false
+    }
+  ],
+  "participant_count": 2
+}
+```
+
+**Add/Remove Members Request:**
+```json
+{
+  "group_jid": "123456789@g.us",
+  "participants": ["1234567890", "0987654321@s.whatsapp.net"]
+}
+```
+Note: Participants can be provided as phone numbers (country code, no + or symbols) or full JIDs.
+
+**Add/Remove Members Response:**
+```json
+{
+  "success": true,
+  "message": "Processed 2 participant(s)",
+  "group_jid": "123456789@g.us",
+  "results": [
+    {"jid": "1234567890@s.whatsapp.net", "error": ""},
+    {"jid": "0987654321@s.whatsapp.net", "error": ""}
+  ]
+}
+```
+
+**Note:** You must be an admin of the group to add or remove members. Some participants may require approval to join (WhatsApp privacy settings).
+
 ## MCP Configuration
 
 Add to Claude Desktop config:

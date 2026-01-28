@@ -1389,3 +1389,162 @@ def archive_chat(jid: str, archive: bool = True) -> Tuple[bool, str]:
         return False, f"Error parsing response"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+
+# Group member management functions
+
+@dataclass
+class GroupParticipant:
+    jid: str
+    name: Optional[str]
+    is_admin: bool
+    is_super_admin: bool
+
+
+@dataclass
+class GroupInfo:
+    jid: str
+    name: str
+    topic: Optional[str]
+    owner_jid: str
+    created_at: Optional[str]
+    participants: List[GroupParticipant]
+    participant_count: int
+
+
+def get_group_info(group_jid: str) -> dict:
+    """Get information about a WhatsApp group including its members.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us)
+
+    Returns:
+        A dictionary containing group info and member list, or error information
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/group"
+        params = {"jid": group_jid}
+
+        response = requests.get(url, params=params)
+        result = response.json()
+
+        if result.get("success", False):
+            return {
+                "success": True,
+                "jid": result.get("jid"),
+                "name": result.get("name"),
+                "topic": result.get("topic"),
+                "owner_jid": result.get("owner_jid"),
+                "created_at": result.get("created_at"),
+                "participants": result.get("participants", []),
+                "participant_count": result.get("participant_count", 0)
+            }
+        else:
+            return {
+                "success": False,
+                "message": result.get("message", "Unknown error")
+            }
+
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "message": f"Request error: {str(e)}"
+        }
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "message": "Error parsing response"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Unexpected error: {str(e)}"
+        }
+
+
+def add_group_members(group_jid: str, participants: List[str]) -> dict:
+    """Add one or more members to a WhatsApp group.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us)
+        participants: List of participant JIDs or phone numbers to add
+
+    Returns:
+        A dictionary containing success status and results for each participant
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/group/members"
+        payload = {
+            "group_jid": group_jid,
+            "participants": participants
+        }
+
+        response = requests.post(url, json=payload)
+        result = response.json()
+
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", "Unknown error"),
+            "group_jid": result.get("group_jid"),
+            "results": result.get("results", [])
+        }
+
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "message": f"Request error: {str(e)}"
+        }
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "message": "Error parsing response"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Unexpected error: {str(e)}"
+        }
+
+
+def remove_group_members(group_jid: str, participants: List[str]) -> dict:
+    """Remove one or more members from a WhatsApp group.
+
+    Args:
+        group_jid: The JID of the group (must end with @g.us)
+        participants: List of participant JIDs or phone numbers to remove
+
+    Returns:
+        A dictionary containing success status and results for each participant
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/group/members"
+        payload = {
+            "group_jid": group_jid,
+            "participants": participants
+        }
+
+        response = requests.delete(url, json=payload)
+        result = response.json()
+
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", "Unknown error"),
+            "group_jid": result.get("group_jid"),
+            "results": result.get("results", [])
+        }
+
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "message": f"Request error: {str(e)}"
+        }
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "message": "Error parsing response"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Unexpected error: {str(e)}"
+        }

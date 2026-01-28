@@ -2035,6 +2035,317 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Handler for getting group info (including members)
+	http.HandleFunc("/api/group", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed. Use GET with ?jid=<group_jid>",
+			})
+			return
+		}
+
+		// Get group JID from query parameter
+		groupJID := r.URL.Query().Get("jid")
+		if groupJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID query parameter is required",
+			})
+			return
+		}
+
+		// Parse the JID
+		jid, err := types.ParseJID(groupJID)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Invalid JID: %v", err),
+			})
+			return
+		}
+
+		// Verify it's a group JID
+		if jid.Server != "g.us" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "JID must be a group (ending with @g.us)",
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Get group info
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to get group info: %v", err),
+			})
+			return
+		}
+
+		// Build participants list
+		participants := make([]map[string]interface{}, 0)
+		for _, p := range groupInfo.Participants {
+			participant := map[string]interface{}{
+				"jid":      p.JID.String(),
+				"is_admin": p.IsAdmin,
+				"is_super_admin": p.IsSuperAdmin,
+			}
+			// Try to get contact name
+			contact, err := client.Store.Contacts.GetContact(context.Background(), p.JID)
+			if err == nil && contact.FullName != "" {
+				participant["name"] = contact.FullName
+			} else if contact.PushName != "" {
+				participant["name"] = contact.PushName
+			}
+			participants = append(participants, participant)
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":      true,
+			"jid":          groupJID,
+			"name":         groupInfo.Name,
+			"topic":        groupInfo.Topic,
+			"created_at":   groupInfo.GroupCreated,
+			"owner_jid":    groupInfo.OwnerJID.String(),
+			"participants": participants,
+			"participant_count": len(participants),
+		})
+	})
+
+	// Handler for managing group members (add/remove)
+	http.HandleFunc("/api/group/members", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPost:
+			// Add member(s) to group
+			var req struct {
+				GroupJID     string   `json:"group_jid"`
+				Participants []string `json:"participants"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.GroupJID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "group_jid is required",
+				})
+				return
+			}
+
+			if len(req.Participants) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "participants array is required and must not be empty",
+				})
+				return
+			}
+
+			// Parse group JID
+			groupJID, err := types.ParseJID(req.GroupJID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Invalid group JID: %v", err),
+				})
+				return
+			}
+
+			// Parse participant JIDs
+			participantJIDs := make([]types.JID, 0)
+			for _, p := range req.Participants {
+				// If no @ sign, assume it's a phone number
+				if !strings.Contains(p, "@") {
+					p = p + "@s.whatsapp.net"
+				}
+				pJID, err := types.ParseJID(p)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"message": fmt.Sprintf("Invalid participant JID %s: %v", p, err),
+					})
+					return
+				}
+				participantJIDs = append(participantJIDs, pJID)
+			}
+
+			// Add participants to group
+			result, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeAdd)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to add participants: %v", err),
+				})
+				return
+			}
+
+			// Build result info
+			resultInfo := make([]map[string]interface{}, 0)
+			for _, r := range result {
+				info := map[string]interface{}{
+					"jid":   r.JID.String(),
+					"error": "",
+				}
+				if r.Error != 0 {
+					info["error"] = fmt.Sprintf("Error code: %d", r.Error)
+				}
+				if r.AddRequest != nil {
+					info["add_request"] = r.AddRequest.Code
+				}
+				resultInfo = append(resultInfo, info)
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"group_jid": req.GroupJID,
+				"results":  resultInfo,
+			})
+
+		case http.MethodDelete:
+			// Remove member(s) from group
+			var req struct {
+				GroupJID     string   `json:"group_jid"`
+				Participants []string `json:"participants"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "Invalid request format",
+				})
+				return
+			}
+
+			if req.GroupJID == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "group_jid is required",
+				})
+				return
+			}
+
+			if len(req.Participants) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": "participants array is required and must not be empty",
+				})
+				return
+			}
+
+			// Parse group JID
+			groupJID, err := types.ParseJID(req.GroupJID)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Invalid group JID: %v", err),
+				})
+				return
+			}
+
+			// Parse participant JIDs
+			participantJIDs := make([]types.JID, 0)
+			for _, p := range req.Participants {
+				// If no @ sign, assume it's a phone number
+				if !strings.Contains(p, "@") {
+					p = p + "@s.whatsapp.net"
+				}
+				pJID, err := types.ParseJID(p)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"success": false,
+						"message": fmt.Sprintf("Invalid participant JID %s: %v", p, err),
+					})
+					return
+				}
+				participantJIDs = append(participantJIDs, pJID)
+			}
+
+			// Remove participants from group
+			result, err := client.UpdateGroupParticipants(context.Background(), groupJID, participantJIDs, whatsmeow.ParticipantChangeRemove)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to remove participants: %v", err),
+				})
+				return
+			}
+
+			// Build result info
+			resultInfo := make([]map[string]interface{}, 0)
+			for _, r := range result {
+				info := map[string]interface{}{
+					"jid":   r.JID.String(),
+					"error": "",
+				}
+				if r.Error != 0 {
+					info["error"] = fmt.Sprintf("Error code: %d", r.Error)
+				}
+				resultInfo = append(resultInfo, info)
+			}
+
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":  true,
+				"message":  fmt.Sprintf("Processed %d participant(s)", len(participantJIDs)),
+				"group_jid": req.GroupJID,
+				"results":  resultInfo,
+			})
+
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed. Use POST to add members, DELETE to remove members",
+			})
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
