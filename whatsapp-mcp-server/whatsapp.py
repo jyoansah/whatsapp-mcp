@@ -55,6 +55,57 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+def resolve_lid_to_phone(jid: str) -> str:
+    """Resolve a LID-based JID to its phone-number JID.
+
+    WhatsApp is migrating from phone JIDs (e.g. 233201358015@s.whatsapp.net) to
+    LID JIDs (e.g. 15788434030727@lid). This resolves LIDs to phone JIDs using
+    the whatsmeow_lid_map table.
+
+    Args:
+        jid: The JID to resolve (e.g., "15788434030727@lid" or "15788434030727")
+
+    Returns:
+        The phone-number JID if a mapping exists, otherwise the original JID
+    """
+    # Only resolve LID JIDs
+    if '@' in jid:
+        if not jid.endswith('@lid'):
+            return jid
+        lid_user = jid.split('@')[0]
+    else:
+        lid_user = jid
+
+    # Check cache first
+    cache_key = f"lid_resolve:{lid_user}"
+    if cache_key in _contact_name_cache:
+        return _contact_name_cache[cache_key]
+
+    try:
+        conn = sqlite3.connect(WHATSMEOW_DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT pn FROM whatsmeow_lid_map WHERE lid = ? LIMIT 1",
+            (lid_user,)
+        )
+
+        result = cursor.fetchone()
+        if result:
+            phone_jid = f"{result[0]}@s.whatsapp.net"
+            _contact_name_cache[cache_key] = phone_jid
+            return phone_jid
+
+        _contact_name_cache[cache_key] = jid
+        return jid
+
+    except sqlite3.Error:
+        return jid
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
 def get_contact_name_from_whatsmeow(jid: str) -> Optional[str]:
     """Get contact name from whatsmeow contacts table.
 
@@ -66,10 +117,13 @@ def get_contact_name_from_whatsmeow(jid: str) -> Optional[str]:
     """
     global _contact_name_cache
 
+    # Resolve LID JIDs to phone JIDs first
+    resolved_jid = resolve_lid_to_phone(jid)
+
     # Normalize JID - ensure it has the @s.whatsapp.net suffix for individual contacts
-    normalized_jid = jid
-    if '@' not in jid:
-        normalized_jid = f"{jid}@s.whatsapp.net"
+    normalized_jid = resolved_jid
+    if '@' not in resolved_jid:
+        normalized_jid = f"{resolved_jid}@s.whatsapp.net"
 
     # Check cache first
     if normalized_jid in _contact_name_cache:
@@ -512,6 +566,9 @@ def list_chats(
         where_clauses = []
         params = []
 
+        # Exclude LID-based chats (they should have been migrated to phone JIDs)
+        where_clauses.append("chats.jid NOT LIKE '%@lid'")
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
@@ -858,6 +915,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
+        # Prefer phone-number JIDs over LID JIDs by ordering @s.whatsapp.net first
         cursor.execute("""
             SELECT
                 c.jid,
@@ -870,6 +928,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
             WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            ORDER BY CASE WHEN c.jid LIKE '%@s.whatsapp.net' THEN 0 ELSE 1 END
             LIMIT 1
         """, (f"%{sender_phone_number}%",))
 
@@ -880,6 +939,12 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
 
         jid = chat_data[0]
         name = chat_data[1]
+
+        # If we got a LID chat, resolve it to the phone JID for display
+        if jid.endswith('@lid'):
+            resolved = resolve_lid_to_phone(jid)
+            if resolved != jid:
+                jid = resolved
 
         # Try to get contact name from whatsmeow
         contact_name = get_contact_name_from_whatsmeow(jid)

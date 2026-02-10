@@ -157,6 +157,100 @@ func (store *MessageStore) runMigrations() {
 	}
 }
 
+// migrateLIDChats moves messages stored under LID JIDs to their phone-number JID equivalents.
+// This is a one-time migration for data stored before LID resolution was added.
+func (store *MessageStore) migrateLIDChats(client *whatsmeow.Client, logger waLog.Logger) {
+	// Find all LID-based chats
+	rows, err := store.db.Query("SELECT jid FROM chats WHERE jid LIKE '%@lid'")
+	if err != nil {
+		logger.Warnf("LID migration: failed to query LID chats: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var lidJIDs []string
+	for rows.Next() {
+		var jid string
+		if err := rows.Scan(&jid); err == nil {
+			lidJIDs = append(lidJIDs, jid)
+		}
+	}
+
+	if len(lidJIDs) == 0 {
+		return
+	}
+
+	logger.Infof("LID migration: found %d LID-based chats to migrate", len(lidJIDs))
+
+	for _, lidJIDStr := range lidJIDs {
+		lidJID, err := types.ParseJID(lidJIDStr)
+		if err != nil {
+			logger.Warnf("LID migration: failed to parse JID %s: %v", lidJIDStr, err)
+			continue
+		}
+
+		pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), lidJID)
+		if err != nil || pnJID.IsEmpty() {
+			logger.Warnf("LID migration: no phone mapping for LID %s: %v", lidJIDStr, err)
+			continue
+		}
+
+		phoneJIDStr := pnJID.String()
+		logger.Infof("LID migration: migrating %s → %s", lidJIDStr, phoneJIDStr)
+
+		// Ensure the phone-number chat exists
+		var phoneExists int
+		store.db.QueryRow("SELECT COUNT(*) FROM chats WHERE jid = ?", phoneJIDStr).Scan(&phoneExists)
+		if phoneExists == 0 {
+			// Copy the LID chat as the phone chat
+			_, err = store.db.Exec(
+				"INSERT INTO chats (jid, name, last_message_time, archived) SELECT ?, name, last_message_time, archived FROM chats WHERE jid = ?",
+				phoneJIDStr, lidJIDStr,
+			)
+			if err != nil {
+				logger.Warnf("LID migration: failed to create phone chat %s: %v", phoneJIDStr, err)
+				continue
+			}
+		}
+
+		// Reassign messages from LID chat to phone chat.
+		// Use INSERT OR IGNORE to skip duplicates (same message ID in both chats).
+		_, err = store.db.Exec(`
+			INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content)
+			SELECT id, ?, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, reply_to_sender, reply_to_content
+			FROM messages WHERE chat_jid = ?
+		`, phoneJIDStr, lidJIDStr)
+		if err != nil {
+			logger.Warnf("LID migration: failed to migrate messages from %s to %s: %v", lidJIDStr, phoneJIDStr, err)
+			continue
+		}
+
+		// Also update sender fields that contain LID user IDs
+		_, err = store.db.Exec(
+			"UPDATE messages SET sender = ? WHERE chat_jid = ? AND sender = ?",
+			pnJID.User, phoneJIDStr, lidJID.User,
+		)
+		if err != nil {
+			logger.Warnf("LID migration: failed to update senders in %s: %v", phoneJIDStr, err)
+		}
+
+		// Update last_message_time on the phone chat to the most recent message
+		store.db.Exec(`
+			UPDATE chats SET last_message_time = (
+				SELECT MAX(timestamp) FROM messages WHERE chat_jid = ?
+			) WHERE jid = ?
+		`, phoneJIDStr, phoneJIDStr)
+
+		// Delete old LID messages and chat
+		store.db.Exec("DELETE FROM messages WHERE chat_jid = ?", lidJIDStr)
+		store.db.Exec("DELETE FROM chats WHERE jid = ?", lidJIDStr)
+
+		logger.Infof("LID migration: successfully migrated %s → %s", lidJIDStr, phoneJIDStr)
+	}
+
+	logger.Infof("LID migration: complete")
+}
+
 // Close the database connection
 func (store *MessageStore) Close() error {
 	return store.db.Close()
@@ -1171,13 +1265,50 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
+// resolveLIDToPhone resolves a LID-based JID to its phone-number-based JID.
+// WhatsApp is migrating from phone JIDs (e.g. 233201358015@s.whatsapp.net) to
+// LID JIDs (e.g. 15788434030727@lid). This causes the same contact to appear
+// as two separate chats. We resolve LIDs to phone JIDs so all messages for the
+// same contact are stored under a single, consistent chat JID.
+func resolveLIDToPhone(client *whatsmeow.Client, jid types.JID, logger waLog.Logger) (types.JID, string) {
+	if jid.Server != types.HiddenUserServer {
+		return jid, jid.String()
+	}
+
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pnJID.IsEmpty() {
+		logger.Warnf("Could not resolve LID %s to phone number: %v", jid.String(), err)
+		return jid, jid.String()
+	}
+
+	logger.Infof("Resolved LID %s → phone %s", jid.String(), pnJID.String())
+	return pnJID, pnJID.String()
+}
+
+// resolveLIDSender resolves a LID sender user ID to the phone number equivalent.
+// This is for the sender field (just the user part, not a full JID).
+func resolveLIDSender(client *whatsmeow.Client, sender string, senderJID types.JID, logger waLog.Logger) string {
+	if senderJID.Server != types.HiddenUserServer {
+		return sender
+	}
+
+	pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), senderJID)
+	if err != nil || pnJID.IsEmpty() {
+		return sender
+	}
+
+	logger.Infof("Resolved sender LID %s → phone %s", sender, pnJID.User)
+	return pnJID.User
+}
+
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
-	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	// Resolve LID JIDs to phone-number JIDs for consistent storage
+	resolvedChat, chatJID := resolveLIDToPhone(client, msg.Info.Chat, logger)
+	sender := resolveLIDSender(client, msg.Info.Sender.User, msg.Info.Sender, logger)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
-	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	name := GetChatName(client, messageStore, resolvedChat, chatJID, nil, sender, logger)
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
@@ -2528,6 +2659,9 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
+	// Migrate any existing LID-based chats to phone-number JIDs
+	messageStore.migrateLIDChats(client, logger)
+
 	// Start REST API server
 	startRESTServer(client, messageStore, 8080)
 
@@ -2642,17 +2776,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			continue
 		}
 
-		chatJID := *conversation.ID
+		rawChatJID := *conversation.ID
 
 		// Try to parse the JID
-		jid, err := types.ParseJID(chatJID)
+		jid, err := types.ParseJID(rawChatJID)
 		if err != nil {
-			logger.Warnf("Failed to parse JID %s: %v", chatJID, err)
+			logger.Warnf("Failed to parse JID %s: %v", rawChatJID, err)
 			continue
 		}
 
+		// Resolve LID JIDs to phone-number JIDs for consistent storage
+		resolvedJID, chatJID := resolveLIDToPhone(client, jid, logger)
+
 		// Get appropriate chat name by passing the history sync conversation directly
-		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+		name := GetChatName(client, messageStore, resolvedJID, chatJID, conversation, "", logger)
 
 		// Process messages
 		messages := conversation.Messages
@@ -2720,14 +2857,21 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
-						sender = *msg.Message.Key.Participant
+						// Participant may be a LID JID string — try to resolve it
+						participantJID, pErr := types.ParseJID(*msg.Message.Key.Participant)
+						if pErr == nil && participantJID.Server == types.HiddenUserServer {
+							resolved, _ := resolveLIDToPhone(client, participantJID, logger)
+							sender = resolved.User
+						} else {
+							sender = *msg.Message.Key.Participant
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {
-						sender = jid.User
+						sender = resolvedJID.User
 					}
 				} else {
-					sender = jid.User
+					sender = resolvedJID.User
 				}
 
 				// Store message
