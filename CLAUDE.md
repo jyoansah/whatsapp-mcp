@@ -150,6 +150,9 @@ Archive or unarchive WhatsApp chats to hide them from the main chat list.
 
 **MCP Tools:**
 - `archive_chat(jid, archive=True)` - Archive or unarchive a chat
+- `list_chats(archived=False)` - List only unarchived chats (inbox)
+- `list_chats(archived=True)` - List only archived chats
+- `list_chats()` - List all chats (default, no filter)
 
 **REST Endpoint:**
 - `POST /api/archive` - Archive or unarchive a chat
@@ -172,7 +175,7 @@ Archive or unarchive WhatsApp chats to hide them from the main chat list.
 }
 ```
 
-**Note:** Archiving a chat will automatically unpin it if it was pinned.
+**Note:** Archiving a chat will automatically unpin it if it was pinned. The archived status is tracked locally in the database, so it reflects the state when chats were archived/unarchived via this MCP. Chats archived directly in the WhatsApp app won't be reflected until you archive/unarchive them via this MCP.
 
 ## Group Member Management
 

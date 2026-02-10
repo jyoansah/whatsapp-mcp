@@ -140,6 +140,21 @@ func (store *MessageStore) runMigrations() {
 			}
 		}
 	}
+
+	// Add archived column to chats table if it doesn't exist
+	var archivedColCount int
+	err := store.db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('chats') WHERE name = 'archived'",
+	).Scan(&archivedColCount)
+	if err != nil || archivedColCount == 0 {
+		// Column doesn't exist, add it with default value of 0 (not archived)
+		_, err = store.db.Exec("ALTER TABLE chats ADD COLUMN archived BOOLEAN DEFAULT 0")
+		if err != nil {
+			fmt.Printf("Warning: Could not add column archived to chats: %v\n", err)
+		} else {
+			fmt.Printf("Added column archived to chats table\n")
+		}
+	}
 }
 
 // Close the database connection
@@ -152,6 +167,15 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// SetChatArchived updates the archived status of a chat
+func (store *MessageStore) SetChatArchived(jid string, archived bool) error {
+	_, err := store.db.Exec(
+		"UPDATE chats SET archived = ? WHERE jid = ?",
+		archived, jid,
 	)
 	return err
 }
@@ -235,7 +259,17 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Extract caption from media messages
+	if img := msg.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		return vid.GetCaption()
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		return doc.GetCaption()
+	}
+
 	return ""
 }
 
@@ -1109,7 +1143,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		audioType := "audio"
+		if aud.GetPTT() {
+			audioType = "voice_note"
+		}
+		return audioType, "audio_" + time.Now().Format("20060102_150405") + ".ogg",
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -1121,6 +1159,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+	}
+
+	// Check for sticker message
+	if sticker := msg.GetStickerMessage(); sticker != nil {
+		return "sticker", "sticker_" + time.Now().Format("20060102_150405") + ".webp",
+			sticker.GetURL(), sticker.GetMediaKey(), sticker.GetFileSHA256(), sticker.GetFileEncSHA256(), sticker.GetFileLength()
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -1906,6 +1950,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				"message": fmt.Sprintf("Failed to archive chat: %v", err),
 			})
 			return
+		}
+
+		// Update the archived status in the local database
+		err = messageStore.SetChatArchived(req.JID, req.Archive)
+		if err != nil {
+			// Log the error but don't fail the request since WhatsApp was updated successfully
+			fmt.Printf("Warning: Could not update archived status in database: %v\n", err)
 		}
 
 		action := "archived"

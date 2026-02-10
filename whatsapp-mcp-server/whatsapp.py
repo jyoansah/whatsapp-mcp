@@ -24,6 +24,7 @@ class Message:
     id: str
     chat_name: Optional[str] = None
     media_type: Optional[str] = None
+    filename: Optional[str] = None
     reply_to_id: Optional[str] = None
     reply_to_sender: Optional[str] = None
     reply_to_content: Optional[str] = None
@@ -183,6 +184,30 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def _format_media_label(media_type: str, filename: str = None) -> str:
+    """Format a human-readable media type label.
+
+    Args:
+        media_type: The media type string from the database
+        filename: Optional filename for document messages
+
+    Returns:
+        A formatted label like [Image], [Voice Note], [Document: report.pdf], etc.
+    """
+    media_labels = {
+        "image": "Image",
+        "video": "Video",
+        "audio": "Audio",
+        "voice_note": "Voice Note",
+        "sticker": "Sticker",
+        "document": "Document",
+    }
+    label = media_labels.get(media_type, media_type.title() if media_type else "Media")
+    if media_type == "document" and filename:
+        return f"[Document: {filename}]"
+    return f"[{label}]"
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -192,9 +217,12 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
 
-    content_prefix = ""
+    # Build media indicator
+    media_indicator = ""
     if hasattr(message, 'media_type') and message.media_type:
-        content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
+        filename = getattr(message, 'filename', None)
+        media_indicator = _format_media_label(message.media_type, filename)
+        media_indicator += f" (ID: {message.id}, Chat: {message.chat_jid}) "
 
     # Add reply context if this message is a reply
     reply_info = ""
@@ -207,7 +235,14 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
 
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
-        output += f"From: {sender_name}: {reply_info}{content_prefix}{message.content}\n"
+        # Build content: media indicator + caption/text
+        content_parts = []
+        if media_indicator:
+            content_parts.append(media_indicator)
+        if message.content:
+            content_parts.append(message.content)
+        display_content = " ".join(content_parts) if content_parts else ""
+        output += f"From: {sender_name}: {reply_info}{display_content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
     return output
@@ -240,18 +275,18 @@ def list_messages(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
-        
+
         # Add filters
         if after:
             try:
                 after = datetime.fromisoformat(after)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'after': {after}. Please use ISO-8601 format.")
-            
+
             where_clauses.append("messages.timestamp > ?")
             params.append(after)
 
@@ -260,34 +295,35 @@ def list_messages(
                 before = datetime.fromisoformat(before)
             except ValueError:
                 raise ValueError(f"Invalid date format for 'before': {before}. Please use ISO-8601 format.")
-            
+
             where_clauses.append("messages.timestamp < ?")
             params.append(before)
 
         if sender_phone_number:
             where_clauses.append("messages.sender = ?")
             params.append(sender_phone_number)
-            
+
         if chat_jid:
             where_clauses.append("messages.chat_jid = ?")
             params.append(chat_jid)
-            
+
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
-            
+            # Search in both content and media type/filename so media messages are findable
+            where_clauses.append("(LOWER(messages.content) LIKE LOWER(?) OR LOWER(messages.media_type) LIKE LOWER(?) OR LOWER(messages.filename) LIKE LOWER(?))")
+            params.extend([f"%{query}%", f"%{query}%", f"%{query}%"])
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
         # Add pagination
         offset = page * limit
         query_parts.append("ORDER BY messages.timestamp DESC")
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
         messages = cursor.fetchall()
-        
+
         result = []
         for msg in messages:
             message = Message(
@@ -299,9 +335,10 @@ def list_messages(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                reply_to_id=msg[8],
-                reply_to_sender=msg[9],
-                reply_to_content=msg[10]
+                filename=msg[8],
+                reply_to_id=msg[9],
+                reply_to_sender=msg[10],
+                reply_to_content=msg[11]
             )
             result.append(message)
             
@@ -339,7 +376,7 @@ def get_message_context(
         
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.filename, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -358,14 +395,15 @@ def get_message_context(
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[8],
-            reply_to_id=msg_data[9],
-            reply_to_sender=msg_data[10],
-            reply_to_content=msg_data[11]
+            filename=msg_data[9],
+            reply_to_id=msg_data[10],
+            reply_to_sender=msg_data[11],
+            reply_to_content=msg_data[12]
         )
-        
+
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -384,14 +422,15 @@ def get_message_context(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                reply_to_id=msg[8],
-                reply_to_sender=msg[9],
-                reply_to_content=msg[10]
+                filename=msg[8],
+                reply_to_id=msg[9],
+                reply_to_sender=msg[10],
+                reply_to_content=msg[11]
             ))
 
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.filename, messages.reply_to_id, messages.reply_to_sender, messages.reply_to_content
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -410,9 +449,10 @@ def get_message_context(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                reply_to_id=msg[8],
-                reply_to_sender=msg[9],
-                reply_to_content=msg[10]
+                filename=msg[8],
+                reply_to_id=msg[9],
+                reply_to_sender=msg[10],
+                reply_to_content=msg[11]
             ))
         
         return MessageContext(
@@ -434,16 +474,26 @@ def list_chats(
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
+    archived: Optional[bool] = None
 ) -> List[Chat]:
-    """Get chats matching the specified criteria."""
+    """Get chats matching the specified criteria.
+
+    Args:
+        query: Optional search term to filter chats by name or JID
+        limit: Maximum number of chats to return (default 20)
+        page: Page number for pagination (default 0)
+        include_last_message: Whether to include the last message in each chat (default True)
+        sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
+        archived: Optional filter for archived status. None returns all, True returns only archived, False returns only unarchived
+    """
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["""
-            SELECT 
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
@@ -452,35 +502,44 @@ def list_chats(
                 messages.is_from_me as last_is_from_me
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
-            
+
         where_clauses = []
         params = []
-        
+
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
             params.extend([f"%{query}%", f"%{query}%"])
-            
+
+        # Filter by archived status if specified
+        if archived is not None:
+            # Handle case where archived column might not exist yet (returns NULL)
+            # NULL is treated as not archived (0)
+            if archived:
+                where_clauses.append("chats.archived = 1")
+            else:
+                where_clauses.append("(chats.archived = 0 OR chats.archived IS NULL)")
+
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
-            
+
         # Add sorting
         order_by = "chats.last_message_time DESC" if sort_by == "last_active" else "chats.name"
         query_parts.append(f"ORDER BY {order_by}")
-        
+
         # Add pagination
         offset = (page ) * limit
         query_parts.append("LIMIT ? OFFSET ?")
         params.extend([limit, offset])
-        
+
         cursor.execute(" ".join(query_parts), tuple(params))
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
             jid = chat_data[0]
@@ -693,6 +752,7 @@ def get_last_interaction(jid: str) -> str:
                 c.jid,
                 m.id,
                 m.media_type,
+                m.filename,
                 m.reply_to_id,
                 m.reply_to_sender,
                 m.reply_to_content
@@ -717,9 +777,10 @@ def get_last_interaction(jid: str) -> str:
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[7],
-            reply_to_id=msg_data[8],
-            reply_to_sender=msg_data[9],
-            reply_to_content=msg_data[10]
+            filename=msg_data[8],
+            reply_to_id=msg_data[9],
+            reply_to_sender=msg_data[10],
+            reply_to_content=msg_data[11]
         )
 
         return format_message(message)
