@@ -2075,12 +2075,32 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		patch := appstate.BuildArchive(targetJID, req.Archive, time.Time{}, nil)
 		err = client.SendAppState(context.Background(), patch)
 		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"success": false,
-				"message": fmt.Sprintf("Failed to archive chat: %v", err),
-			})
-			return
+			// Check if this is an LTHash mismatch / 409 conflict error
+			errStr := err.Error()
+			if strings.Contains(errStr, "LTHash") || strings.Contains(errStr, "409") || strings.Contains(errStr, "conflict") {
+				fmt.Printf("App state desync detected for archive operation, performing full resync of regular_low...\n")
+
+				// Force a full resync of the regular_low app state
+				resyncErr := client.FetchAppState(context.Background(), appstate.WAPatchRegularLow, true, false)
+				if resyncErr != nil {
+					fmt.Printf("Warning: app state resync failed: %v\n", resyncErr)
+				} else {
+					fmt.Printf("App state resync completed, retrying archive operation...\n")
+				}
+
+				// Retry the archive operation regardless of resync result
+				patch = appstate.BuildArchive(targetJID, req.Archive, time.Time{}, nil)
+				err = client.SendAppState(context.Background(), patch)
+			}
+
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": false,
+					"message": fmt.Sprintf("Failed to archive chat: %v", err),
+				})
+				return
+			}
 		}
 
 		// Update the archived status in the local database
@@ -2100,6 +2120,93 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			"message": fmt.Sprintf("Chat %s successfully", action),
 			"jid":     req.JID,
 			"archive": req.Archive,
+		})
+	})
+
+	// Handler for resyncing app state (fixes LTHash desync issues)
+	http.HandleFunc("/api/resync-state", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Method not allowed",
+			})
+			return
+		}
+
+		// Check if client is connected
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		// Parse optional request body for specific state names
+		var req struct {
+			Names []string `json:"names"` // e.g., ["regular_low", "regular_high"]
+		}
+		// Body is optional - if empty or invalid, resync all states
+		json.NewDecoder(r.Body).Decode(&req)
+
+		// Map of valid state names
+		stateNames := map[string]appstate.WAPatchName{
+			"regular_low":          appstate.WAPatchRegularLow,
+			"regular_high":         appstate.WAPatchRegularHigh,
+			"regular":              appstate.WAPatchRegular,
+			"critical_block":       appstate.WAPatchCriticalBlock,
+			"critical_unblock_low": appstate.WAPatchCriticalUnblockLow,
+		}
+
+		// Determine which states to resync
+		var toResync []appstate.WAPatchName
+		if len(req.Names) > 0 {
+			for _, name := range req.Names {
+				if patchName, ok := stateNames[name]; ok {
+					toResync = append(toResync, patchName)
+				}
+			}
+		}
+		if len(toResync) == 0 {
+			// Default: resync the most commonly problematic states
+			toResync = []appstate.WAPatchName{
+				appstate.WAPatchRegularLow,
+				appstate.WAPatchRegularHigh,
+			}
+		}
+
+		results := make([]map[string]interface{}, 0, len(toResync))
+		allSuccess := true
+		for _, name := range toResync {
+			fmt.Printf("Resyncing app state: %s\n", name)
+			err := client.FetchAppState(context.Background(), name, true, false)
+			result := map[string]interface{}{
+				"name":    string(name),
+				"success": err == nil,
+			}
+			if err != nil {
+				result["error"] = err.Error()
+				allSuccess = false
+				fmt.Printf("Failed to resync %s: %v\n", name, err)
+			} else {
+				fmt.Printf("Successfully resynced %s\n", name)
+			}
+			results = append(results, result)
+		}
+
+		status := http.StatusOK
+		if !allSuccess {
+			status = http.StatusInternalServerError
+		}
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": allSuccess,
+			"message": fmt.Sprintf("Resynced %d app state(s)", len(toResync)),
+			"results": results,
 		})
 	})
 

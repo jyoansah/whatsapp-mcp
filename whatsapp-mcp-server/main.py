@@ -21,6 +21,7 @@ from whatsapp import (
     unwatch_channel as whatsapp_unwatch_channel,
     list_watched_channels as whatsapp_list_watched_channels,
     archive_chat as whatsapp_archive_chat,
+    resync_app_state as whatsapp_resync_app_state,
     get_group_info as whatsapp_get_group_info,
     add_group_members as whatsapp_add_group_members,
     remove_group_members as whatsapp_remove_group_members
@@ -459,6 +460,25 @@ def archive_chat(jid: str, archive: bool = True) -> Dict[str, Any]:
         "success": success,
         "message": status_message
     }
+
+
+@mcp.tool()
+def resync_app_state(names: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Force a full resync of WhatsApp app state to fix sync issues.
+
+    Use this when archive, pin, mute, or star operations fail with 409 conflict or LTHash errors.
+    The resync clears the local state cache and re-fetches all patches from WhatsApp servers.
+
+    Args:
+        names: Optional list of specific state names to resync.
+               Valid values: "regular_low" (archive/pin), "regular_high" (mute/star),
+               "regular", "critical_block", "critical_unblock_low".
+               If not provided, resyncs regular_low and regular_high (most common).
+
+    Returns:
+        A dictionary containing success status and per-state resync results
+    """
+    return whatsapp_resync_app_state(names)
 
 
 @mcp.tool()

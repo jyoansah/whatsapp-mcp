@@ -177,6 +177,38 @@ Archive or unarchive WhatsApp chats to hide them from the main chat list.
 
 **Note:** Archiving a chat will automatically unpin it if it was pinned. The archived status is tracked locally in the database, so it reflects the state when chats were archived/unarchived via this MCP. Chats archived directly in the WhatsApp app won't be reflected until you archive/unarchive them via this MCP.
 
+**LTHash Desync Handling:** The archive handler automatically detects 409 conflict / LTHash mismatch errors (caused by app state desync with WhatsApp servers) and performs a full resync of the `regular_low` app state before retrying. If archiving still fails after automatic resync, use `resync_app_state()` to manually force a full state reset.
+
+## App State Resync
+
+Force a full resync of WhatsApp app state when operations like archive, pin, mute, or star fail with 409/LTHash errors.
+
+**MCP Tools:**
+- `resync_app_state(names?)` - Resync specific or default app states
+
+**REST Endpoint:**
+- `POST /api/resync-state` - Force app state resync
+
+**Request format (optional body):**
+```json
+{
+  "names": ["regular_low", "regular_high"]
+}
+```
+Valid state names: `regular_low` (archive/pin), `regular_high` (mute/star), `regular`, `critical_block`, `critical_unblock_low`. If no names provided, resyncs `regular_low` and `regular_high`.
+
+**Response format:**
+```json
+{
+  "success": true,
+  "message": "Resynced 2 app state(s)",
+  "results": [
+    {"name": "regular_low", "success": true},
+    {"name": "regular_high", "success": true}
+  ]
+}
+```
+
 ## Group Member Management
 
 Manage members in WhatsApp groups. You must be an admin of the group to add or remove members.

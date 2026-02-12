@@ -1517,6 +1517,55 @@ def archive_chat(jid: str, archive: bool = True) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 
+# App state resync functions
+
+def resync_app_state(names: Optional[List[str]] = None) -> dict:
+    """Force a full resync of WhatsApp app state to fix LTHash desync issues.
+
+    This is useful when archive, pin, mute, or star operations fail with
+    409 conflict / LTHash mismatch errors.
+
+    Args:
+        names: Optional list of specific state names to resync.
+               Valid values: "regular_low", "regular_high", "regular",
+               "critical_block", "critical_unblock_low".
+               If not provided, resyncs regular_low and regular_high.
+
+    Returns:
+        A dictionary containing success status and per-state results
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/resync-state"
+        payload = {}
+        if names:
+            payload["names"] = names
+
+        response = requests.post(url, json=payload)
+        result = response.json()
+
+        return {
+            "success": result.get("success", False),
+            "message": result.get("message", "Unknown response"),
+            "results": result.get("results", [])
+        }
+
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "message": f"Request error: {str(e)}"
+        }
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "message": f"Error parsing response: {response.text}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Unexpected error: {str(e)}"
+        }
+
+
 # Group member management functions
 
 @dataclass
