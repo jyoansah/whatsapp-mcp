@@ -1519,26 +1519,35 @@ def archive_chat(jid: str, archive: bool = True) -> Tuple[bool, str]:
 
 # App state resync functions
 
-def resync_app_state(names: Optional[List[str]] = None) -> dict:
+def resync_app_state(names: Optional[List[str]] = None, force: bool = False) -> dict:
     """Force a full resync of WhatsApp app state to fix LTHash desync issues.
 
     This is useful when archive, pin, mute, or star operations fail with
     409 conflict / LTHash mismatch errors.
+
+    When force=True, the local app state snapshot is wiped from SQLite before
+    fetching. This recovers from corrupt snapshots where even snapshot
+    verification fails (e.g. "failed to verify snapshot: mismatching LTHash").
+    Normal resync cannot recover from this condition.
 
     Args:
         names: Optional list of specific state names to resync.
                Valid values: "regular_low", "regular_high", "regular",
                "critical_block", "critical_unblock_low".
                If not provided, resyncs regular_low and regular_high.
+        force: If True, wipe local app state tables before fetching to recover
+               from corrupt snapshot LTHash mismatches. Default False.
 
     Returns:
         A dictionary containing success status and per-state results
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/resync-state"
-        payload = {}
+        payload: dict = {}
         if names:
             payload["names"] = names
+        if force:
+            payload["force"] = True
 
         response = requests.post(url, json=payload)
         result = response.json()

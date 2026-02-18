@@ -463,22 +463,28 @@ def archive_chat(jid: str, archive: bool = True) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def resync_app_state(names: Optional[List[str]] = None) -> Dict[str, Any]:
+def resync_app_state(names: Optional[List[str]] = None, force: bool = False) -> Dict[str, Any]:
     """Force a full resync of WhatsApp app state to fix sync issues.
 
     Use this when archive, pin, mute, or star operations fail with 409 conflict or LTHash errors.
     The resync clears the local state cache and re-fetches all patches from WhatsApp servers.
+
+    When operations still fail after a normal resync (e.g. "failed to verify snapshot:
+    mismatching LTHash"), use force=True. This wipes the local app state snapshot from
+    SQLite so WhatsApp sends a complete fresh snapshot, bypassing the corrupt LTHash check.
 
     Args:
         names: Optional list of specific state names to resync.
                Valid values: "regular_low" (archive/pin), "regular_high" (mute/star),
                "regular", "critical_block", "critical_unblock_low".
                If not provided, resyncs regular_low and regular_high (most common).
+        force: If True, wipe local app state tables before fetching. Use when a normal
+               resync still fails with LTHash mismatch on the snapshot itself. Default False.
 
     Returns:
         A dictionary containing success status and per-state resync results
     """
-    return whatsapp_resync_app_state(names)
+    return whatsapp_resync_app_state(names, force=force)
 
 
 @mcp.tool()

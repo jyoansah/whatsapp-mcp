@@ -2149,6 +2149,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Parse optional request body for specific state names
 		var req struct {
 			Names []string `json:"names"` // e.g., ["regular_low", "regular_high"]
+			Force bool     `json:"force"` // wipe local app state tables before fetching (fixes corrupt LTHash)
 		}
 		// Body is optional - if empty or invalid, resync all states
 		json.NewDecoder(r.Body).Decode(&req)
@@ -2179,10 +2180,38 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			}
 		}
 
+		// When force=true, wipe the local app state snapshot from SQLite before
+		// fetching. A normal FetchAppState(true) still tries to verify the local
+		// snapshot's LTHash before applying server patches — if the snapshot itself
+		// is corrupt the verification fails and the resync cannot recover. Wiping
+		// the rows resets the local version to 0, so WhatsApp sends a full fresh
+		// snapshot instead of incremental patches, bypassing the broken LTHash.
+		if req.Force {
+			fmt.Printf("Force resync requested — wiping local app state tables before fetching\n")
+			wipeDB, wipeErr := sql.Open("sqlite3", "file:store/whatsapp.db?_foreign_keys=off")
+			if wipeErr != nil {
+				fmt.Printf("Warning: could not open whatsapp.db for wipe: %v\n", wipeErr)
+			} else {
+				defer wipeDB.Close()
+				for _, name := range toResync {
+					nameStr := string(name)
+					_, err1 := wipeDB.ExecContext(context.Background(),
+						"DELETE FROM whatsmeow_app_state_version WHERE name=?", nameStr)
+					_, err2 := wipeDB.ExecContext(context.Background(),
+						"DELETE FROM whatsmeow_app_state_mutation_macs WHERE name=?", nameStr)
+					if err1 != nil || err2 != nil {
+						fmt.Printf("Warning: wipe of %s partial — version_err=%v macs_err=%v\n", nameStr, err1, err2)
+					} else {
+						fmt.Printf("Wiped local app state for %s\n", nameStr)
+					}
+				}
+			}
+		}
+
 		results := make([]map[string]interface{}, 0, len(toResync))
 		allSuccess := true
 		for _, name := range toResync {
-			fmt.Printf("Resyncing app state: %s\n", name)
+			fmt.Printf("Resyncing app state: %s (force=%v)\n", name, req.Force)
 			err := client.FetchAppState(context.Background(), name, true, false)
 			result := map[string]interface{}{
 				"name":    string(name),
@@ -2202,10 +2231,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		if !allSuccess {
 			status = http.StatusInternalServerError
 		}
+		action := "Resynced"
+		if req.Force {
+			action = "Force-resynced"
+		}
 		w.WriteHeader(status)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": allSuccess,
-			"message": fmt.Sprintf("Resynced %d app state(s)", len(toResync)),
+			"message": fmt.Sprintf("%s %d app state(s)", action, len(toResync)),
+			"force":   req.Force,
 			"results": results,
 		})
 	})
