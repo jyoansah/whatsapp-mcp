@@ -29,5 +29,3 @@ require (
 	golang.org/x/text v0.34.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
-
-replace go.mau.fi/whatsmeow => github.com/drapesinc/whatsmeow v0.0.0-20260218153556-72246d5ec632
