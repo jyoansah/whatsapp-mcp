@@ -545,29 +545,39 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        # Build base query
-        query_parts = ["""
-            SELECT
-                chats.jid,
-                chats.name,
-                chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
-            FROM chats
-        """]
-
+        # Build base query - only reference messages table when joining
         if include_last_message:
-            query_parts.append("""
+            query_parts = ["""
+                SELECT
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    messages.content as last_message,
+                    messages.sender as last_sender,
+                    messages.is_from_me as last_is_from_me
+                FROM chats
                 LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
-            """)
+            """]
+        else:
+            query_parts = ["""
+                SELECT
+                    chats.jid,
+                    chats.name,
+                    chats.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats
+            """]
 
         where_clauses = []
         params = []
 
         # Exclude LID-based chats (they should have been migrated to phone JIDs)
         where_clauses.append("chats.jid NOT LIKE '%@lid'")
+        # Exclude status broadcast - it's not a real chat
+        where_clauses.append("chats.jid != 'status@broadcast'")
 
         if query:
             where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
@@ -856,21 +866,29 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
 
-        query = """
-            SELECT
-                c.jid,
-                c.name,
-                c.last_message_time,
-                m.content as last_message,
-                m.sender as last_sender,
-                m.is_from_me as last_is_from_me
-            FROM chats c
-        """
-
         if include_last_message:
-            query += """
+            query = """
+                SELECT
+                    c.jid,
+                    c.name,
+                    c.last_message_time,
+                    m.content as last_message,
+                    m.sender as last_sender,
+                    m.is_from_me as last_is_from_me
+                FROM chats c
                 LEFT JOIN messages m ON c.jid = m.chat_jid
                 AND c.last_message_time = m.timestamp
+            """
+        else:
+            query = """
+                SELECT
+                    c.jid,
+                    c.name,
+                    c.last_message_time,
+                    NULL as last_message,
+                    NULL as last_sender,
+                    NULL as last_is_from_me
+                FROM chats c
             """
 
         query += " WHERE c.jid = ?"
