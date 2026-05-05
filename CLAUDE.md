@@ -36,47 +36,125 @@ Claude Code ────SSE──→   │  Go Bridge (:8080) ←──→ Whats
 
 ## Repositories and Remotes
 
-This is a fork of `lharries/whatsapp-mcp`. You don't have write access to origin.
+This repo is a fork of `lharries/whatsapp-mcp`, hosted at `drapesinc/whatsapp-mcp`. It is consumed by the `server` repo as a git submodule at `whatsapp-mcp/`. Both mini and hz-dr build their containers from this submodule path — same source, same image.
+
+When checked out via the submodule, the only remote is `origin` (drapesinc/whatsapp-mcp). Push there:
 
 ```bash
-origin  https://github.com/lharries/whatsapp-mcp.git   # upstream, read-only
-fork    git@github.com:jyoansah/whatsapp-mcp.git        # our fork, push here
+cd ${DOCKERDIR:-~/server}/whatsapp-mcp
+git push origin main
 ```
 
-**Always push to `fork`, not `origin`:**
+After pushing, bump the submodule pointer in the parent `server` repo so other servers can pull the new commit:
+
 ```bash
-git push fork main
+cd ${DOCKERDIR:-~/server}
+git add whatsapp-mcp
+git commit -m "submodule: bump whatsapp-mcp"
+git push
+```
+
+Pulling on another host:
+
+```bash
+cd ${DOCKERDIR:-~/server}
+git pull
+git submodule update --init whatsapp-mcp
+./scripts/compose-up.sh build whatsapp-mcp
+./scripts/compose-up.sh up -d whatsapp-mcp
+```
+
+If you're tracking upstream `lharries/whatsapp-mcp`, add it as a remote in your local checkout — but don't push there:
+
+```bash
+git remote add upstream https://github.com/lharries/whatsapp-mcp.git
+git fetch upstream
 ```
 
 ---
 
-## Deployment
+## Deployments
 
-### How It Runs
+There are **two managed deployments** of this MCP plus a documented path for **anyone running their own**. All three use the same image built from this repo; what differs is which WhatsApp account is linked, where it runs, and how it's auth-gated.
 
-The WhatsApp MCP runs as a Docker container on the Mac Mini, built from `/Users/serveradmin/server/whatsapp-mcp.Dockerfile`. The container runs both the Go bridge and Python MCP server via a watchdog start script.
+| Deployment | Server | WhatsApp account | SSE endpoint | Media endpoint | Auth | Compose file |
+|------------|--------|------------------|--------------|----------------|------|--------------|
+| **Drapes business** (default for Drapes work) | hz-dr | Drapes business number | `https://whatsapp.drapesinc.com/sse` | `https://whatsapp.drapesinc.com/api/media/...` | Bearer token (`WHATSAPP_MCP_BEARER_TOKEN`) | `compose/hz/whatsapp-mcp.yml` |
+| **Yaw personal** | Mac Mini | Yaw's personal number | `https://mcp.mini.jyoansah.me/whatsapp/sse` | `https://whatsapp.mini.jyoansah.me/api/media/...` | Tailnet-only DNS | `compose/mini/whatsapp-mcp.yml` |
+| **Your personal** | Anywhere | Your number | Up to you | Up to you | Up to you | See "Run your own" below |
 
-### Connection Chain (Claude → WhatsApp)
+For client work, **default to the Drapes-business deployment on hz-dr.** The mini deployment is Yaw's personal account and shouldn't be the path for team or client conversations.
+
+### Connecting Claude Code
+
+Add to `~/.claude.json` under `mcpServers`. **Drapes business (recommended for team / client work):**
+
+```json
+"whatsapp-drapes": {
+  "command": "npx",
+  "args": [
+    "-y", "mcp-remote",
+    "https://whatsapp.drapesinc.com/sse",
+    "--transport", "sse-only",
+    "--header", "Authorization: Bearer ${WHATSAPP_MCP_BEARER_TOKEN}"
+  ]
+}
+```
+
+The bearer token is in 1Password (Drapes vault) — ask Yaw if you need it. Tools land as `mcp__whatsapp-drapes__*`.
+
+**Yaw personal (Mini, tailnet only):**
+
+```json
+"whatsapp": {
+  "command": "npx",
+  "args": [
+    "-y", "mcp-remote",
+    "https://mcp.mini.jyoansah.me/whatsapp/sse",
+    "--transport", "sse-only"
+  ]
+}
+```
+
+Requires Tailscale on the client machine. Tools land as `mcp__whatsapp__*`.
+
+### Connection chain
+
+The same image and ports run on both servers:
 
 ```
-Claude Desktop/Code
-  → mcp-remote (npx)
-    → https://mcp.mini.jyoansah.me/whatsapp/sse
-      → Tailscale (100.115.204.81:443)
-        → Tailscale Serve → 127.0.0.1:8443
-          → SSH tunnel → Colima VM:443
-            → Traefik (strips /whatsapp prefix)
-              → whatsapp-mcp container:8000 (Python MCP SSE)
-                → localhost:8080 (Go Bridge REST API)
-                  → WhatsApp Web API
+Python MCP SSE: container :8000   ← /sse (and /messages/*)
+Go bridge REST: container :8080   ← /api/* (download_media, send file, etc.)
 ```
 
-### Network Routing
+Traefik routes the public hostname to those internal ports. `WHATSAPP_PUBLIC_URL` tells the bridge what hostname to stamp into `download_media` responses so URLs are reachable from outside the container.
 
-| Domain | Port | Target |
-|--------|------|--------|
-| `mcp.mini.jyoansah.me/whatsapp/*` | 8000 | MCP SSE (Python) — prefix stripped by Traefik |
-| `whatsapp.mini.jyoansah.me/*` | 8080 | REST API (Go bridge) — direct |
+### Run your own personal instance
+
+This repo is a fork of `lharries/whatsapp-mcp` plus a Dockerfile, watchdog start script, LTHash patch, and a few feature additions (scheduled messages, channel watcher, media REST endpoint). To run your own instance against your personal WhatsApp:
+
+1. Clone the repo somewhere on the host that will run the container.
+2. Build the image:
+   ```bash
+   docker build -t whatsapp-mcp -f whatsapp-mcp.Dockerfile .
+   ```
+3. Run it (basic stdio/SSE, no reverse proxy):
+   ```bash
+   docker run -d --name whatsapp-mcp \
+     -e MCP_TRANSPORT=sse \
+     -e WHATSAPP_PUBLIC_URL=http://<your-host-or-domain>:8080 \
+     -p 8000:8000 -p 8080:8080 \
+     -v whatsapp-mcp-data:/app/store \
+     whatsapp-mcp
+   ```
+4. Watch the logs once: `docker logs -f whatsapp-mcp`. The bridge prints a QR code on first start — scan it from WhatsApp → Settings → Linked Devices.
+5. Point Claude Code at `http://<your-host>:8000/sse` (or front it with your own reverse proxy + auth — `compose/hz/whatsapp-mcp.yml` is the worked example).
+
+Things to know if you self-host:
+
+- The bridge is your account, with full read/send privileges. Don't expose `:8000` or `:8080` to the public internet without auth in front.
+- `WHATSAPP_PUBLIC_URL` must point at whatever hostname your client/agent can reach `/api/media/*` on. Without it, `download_media` returns `http://localhost:8080/...` and the agent can't fetch files.
+- Persistent storage at `/app/store` holds your WhatsApp credentials. Lose the volume → re-scan the QR code.
 
 ### Build and Deploy
 
@@ -105,12 +183,13 @@ docker logs whatsapp-mcp --tail 20
 
 ### Environment Variables
 
-Set in `compose/mini/whatsapp-mcp.yml`:
+Set in the relevant compose file (`compose/mini/whatsapp-mcp.yml` for Yaw-personal, `compose/hz/whatsapp-mcp.yml` for Drapes-business):
 
 | Variable | Purpose |
 |----------|---------|
 | `MCP_TRANSPORT=sse` | MCP server uses SSE transport (not stdio) |
 | `WHATSAPP_WEBHOOK_URL` | n8n webhook for watched channel notifications |
+| `WHATSAPP_PUBLIC_URL` | Public base URL the bridge stamps into `download_media` responses. Without it, `public_url` comes back as `http://localhost:8080/...` and is unreachable from outside the container. Set to the hostname Traefik (or whatever proxy) routes to port 8080. |
 
 ---
 
@@ -119,7 +198,7 @@ Set in `compose/mini/whatsapp-mcp.yml`:
 ### Making Go Bridge Changes
 
 ```bash
-cd /Users/serveradmin/Dev/whatsapp-mcp/whatsapp-bridge
+cd ${DOCKERDIR:-~/server}/whatsapp-mcp/whatsapp-bridge
 
 # Edit main.go
 # Build locally to check for compile errors:
@@ -131,17 +210,23 @@ cd ~/server
 ./scripts/compose-up.sh up -d whatsapp-mcp
 docker logs whatsapp-mcp --tail 20
 
-# Commit and push:
-cd /Users/serveradmin/Dev/whatsapp-mcp
+# Commit and push from the submodule (drapesinc/whatsapp-mcp):
+cd ${DOCKERDIR:-~/server}/whatsapp-mcp
 git add whatsapp-bridge/
 git commit -m "fix/feat: description"
-git push fork main
+git push origin main
+
+# Then bump the submodule pointer in the parent server repo:
+cd ${DOCKERDIR:-~/server}
+git add whatsapp-mcp
+git commit -m "submodule: bump whatsapp-mcp"
+git push
 ```
 
 ### Making Python MCP Changes
 
 ```bash
-cd /Users/serveradmin/Dev/whatsapp-mcp/whatsapp-mcp-server
+cd ${DOCKERDIR:-~/server}/whatsapp-mcp/whatsapp-mcp-server
 
 # Edit main.py or whatsapp.py
 # Test locally (requires bridge running):
