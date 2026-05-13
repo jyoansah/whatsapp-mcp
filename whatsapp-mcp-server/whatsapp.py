@@ -354,12 +354,20 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
+            # Resolve LID numbers to phone numbers (sender column stores phone numbers, not LIDs)
+            resolved_sender = sender_phone_number
+            if sender_phone_number.isdigit():
+                lookup = resolve_lid_to_phone(f"{sender_phone_number}@lid")
+                if lookup.endswith('@s.whatsapp.net'):
+                    resolved_sender = lookup.split('@')[0]
+            where_clauses.append("messages.sender IN (?, ?)")
+            params.extend([sender_phone_number, resolved_sender])
 
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            # Resolve @lid chat_jid to phone JID
+            resolved_chat_jid = resolve_lid_to_phone(chat_jid) if chat_jid.endswith('@lid') else chat_jid
+            where_clauses.append("messages.chat_jid IN (?, ?)")
+            params.extend([chat_jid, resolved_chat_jid])
 
         if query:
             # Search in both content and media type/filename so media messages are findable
@@ -645,9 +653,12 @@ def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number.
 
     Searches both the chats table and whatsmeow contacts for matching contacts.
+    For @lid contacts, resolves to phone-JID equivalent and dedupes.
     """
     result = []
     seen_jids = set()
+    # Track LID-resolved phone JIDs separately so we can prefer them and dedupe later
+    lid_resolutions: dict[str, str] = {}  # original_lid_jid -> resolved_phone_jid
 
     # First, search whatsmeow contacts (more accurate names)
     try:
@@ -680,14 +691,25 @@ def search_contacts(query: str) -> List[Contact]:
             full_name, push_name, business_name = contact_data[1], contact_data[2], contact_data[3]
             name = full_name or push_name or business_name
 
-            if jid not in seen_jids:
+            # If this is a @lid contact, resolve to phone JID so callers can use it for chat lookups
+            display_jid = jid
+            if jid.endswith('@lid'):
+                resolved = resolve_lid_to_phone(jid)
+                if resolved != jid and resolved.endswith('@s.whatsapp.net'):
+                    display_jid = resolved
+                    lid_resolutions[jid] = resolved
+
+            if display_jid not in seen_jids:
                 contact = Contact(
-                    phone_number=jid.split('@')[0] if '@' in jid else jid,
+                    phone_number=display_jid.split('@')[0] if '@' in display_jid else display_jid,
                     name=name,
-                    jid=jid
+                    jid=display_jid
                 )
                 result.append(contact)
-                seen_jids.add(jid)
+                seen_jids.add(display_jid)
+                # Also mark the original LID so subsequent rows for the same phone are skipped
+                if display_jid != jid:
+                    seen_jids.add(jid)
 
     except sqlite3.Error as e:
         print(f"Database error while searching whatsmeow contacts: {e}")
@@ -743,16 +765,20 @@ def search_contacts(query: str) -> List[Contact]:
 
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
-    
+
     Args:
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
+    # Resolve @lid JIDs to phone JIDs since chats are keyed by @s.whatsapp.net
+    resolved_jid = resolve_lid_to_phone(jid) if jid.endswith('@lid') else jid
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
-        
+
+        # Match both original and resolved JID (covers either form being stored)
         cursor.execute("""
             SELECT DISTINCT
                 c.jid,
@@ -763,10 +789,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.is_from_me as last_is_from_me
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN (?, ?) OR c.jid IN (?, ?)
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
+        """, (jid, resolved_jid, jid, resolved_jid, limit, page * limit))
         
         chats = cursor.fetchall()
 
@@ -805,6 +831,9 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
+    # Resolve @lid JIDs to phone JIDs since chats are keyed by @s.whatsapp.net
+    resolved_jid = resolve_lid_to_phone(jid) if jid.endswith('@lid') else jid
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -825,10 +854,10 @@ def get_last_interaction(jid: str) -> str:
                 m.reply_to_content
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN (?, ?) OR c.jid IN (?, ?)
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
+        """, (jid, resolved_jid, jid, resolved_jid))
 
         msg_data = cursor.fetchone()
 
@@ -862,6 +891,10 @@ def get_last_interaction(jid: str) -> str:
 
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
+    # Resolve @lid JIDs to phone JIDs since chats are keyed by @s.whatsapp.net
+    if chat_jid.endswith('@lid'):
+        chat_jid = resolve_lid_to_phone(chat_jid)
+
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
