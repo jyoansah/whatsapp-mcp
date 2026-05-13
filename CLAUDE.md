@@ -71,6 +71,8 @@ git remote add upstream https://github.com/lharries/whatsapp-mcp.git
 git fetch upstream
 ```
 
+The Drapes whatsmeow fork (`github.com/drapesinc/whatsmeow`) wired in via the `replace` directive in `whatsapp-bridge/go.mod` is shared by both deployments.
+
 ---
 
 ## Deployments
@@ -175,11 +177,10 @@ docker logs whatsapp-mcp --tail 20
 ### What the Dockerfile Does
 
 1. `golang:1.25-alpine` — builds the Go bridge as a static binary
-2. `go mod vendor` — vendors all dependencies locally
-3. `sed` patch — makes LTHash verification non-fatal (see LTHash section below)
-4. Builds Go binary with `-mod=vendor`
-5. `python:3.11-slim` — runs the MCP server with uv
-6. Symlinks `/app/store` for shared SQLite access
+2. `go mod vendor` — vendors all dependencies locally (resolves the whatsmeow `replace` directive to the Drapes fork)
+3. Builds Go binary with `-mod=vendor`
+4. `python:3.11-slim` — runs the MCP server with uv
+5. Symlinks `/app/store` for shared SQLite access
 
 ### Environment Variables
 
@@ -253,15 +254,17 @@ uv add <package>
 # Rebuild Docker container
 ```
 
-### IMPORTANT: Never auto-update whatsmeow
+### Updating whatsmeow
 
-Do NOT add `go get -u go.mau.fi/whatsmeow@latest` to the Dockerfile or run it before building. The Dockerfile applies a build-time patch to the vendored whatsmeow source. Auto-updating would vendor a different version that the sed patch might not match, silently breaking the LTHash fix.
+`go.mod` pins `go.mau.fi/whatsmeow` to the Drapes fork via a `replace` directive (`github.com/drapesinc/whatsmeow`). The fork sits on top of upstream `tulir/whatsmeow` and adds the diverging-LTHash handling — see the LTHash section below.
 
-To update whatsmeow intentionally:
-1. Update the version in `go.mod`
-2. Run `go mod tidy`
-3. Verify the sed target string still exists in the new version
-4. Rebuild and test
+To pull in upstream changes:
+
+1. In `~/Dev/whatsmeow-fork`, fetch the latest upstream and rebase: `git fetch upstream && git rebase upstream/main`, resolve any conflicts in `appstate/decode.go`, force-push to `origin` (drapesinc).
+2. Bump the require version + the replace pseudo-version in `whatsapp-bridge/go.mod` to match the new fork HEAD.
+3. `go mod tidy`, rebuild the container, test.
+
+Do NOT add `go get -u go.mau.fi/whatsmeow@latest` to the Dockerfile or to local workflow — it would clobber the replace directive and lose the LTHash fix silently.
 
 ---
 
@@ -341,37 +344,29 @@ docker logs -f whatsapp-mcp
 
 ---
 
-## LTHash Build-Time Patch
+## LTHash Diverging-Hash Handling (via Drapes whatsmeow fork)
 
 ### What It Is
 
-WhatsApp syncs settings (archive, pin, mute, star) across devices using "app state" with LTHash rolling integrity verification. The Dockerfile applies a one-line `sed` patch to whatsmeow's `appstate/decode.go` that changes `validateSnapshotMAC()` to log LTHash mismatches as warnings instead of returning errors.
+WhatsApp syncs settings (archive, pin, mute, star) across devices using "app state" with LTHash rolling integrity verification. The Drapes fork of whatsmeow (`github.com/drapesinc/whatsmeow`, wired in via `replace` in `go.mod`) changes the patch-decode loop so a diverged LTHash logs a warning and skips verification for that patch instead of aborting.
 
 ### Why It's Needed
 
-WhatsApp's servers sometimes send REMOVE operations that reference value MACs from snapshots that have been compacted/pruned. Without the previous value MAC, the rolling hash can't be computed correctly, making verification mathematically impossible. This causes permanent failures for archive/pin/mute/star operations.
+WhatsApp's servers sometimes send REMOVE operations that reference value MACs from snapshots that have been compacted/pruned. Without the previous value MAC, the rolling hash can't be computed correctly, making verification mathematically impossible. Without this handling, archive/pin/mute/star operations break permanently the moment a sync gap shows up.
 
 ### How It Works
 
-```
-# In the Dockerfile, after go mod vendor:
-sed -i 's|err = fmt.Errorf("failed to verify patch v%d: %w", currentState.Version, ErrMismatchingLTHash)|proc.Log.Warnf("LTHash mismatch for %s v%d (non-fatal, skipping verification)", name, currentState.Version)|' \
-    vendor/go.mau.fi/whatsmeow/appstate/decode.go
-```
+The fork rewrites the `validatePatch` and snapshot-decode code paths in `appstate/decode.go`:
 
-This changes one line in `validateSnapshotMAC()`:
-- **Before:** Returns error → caller aborts → archive/pin/mute permanently broken
-- **After:** Logs warning → caller continues → mutations processed normally
+- When LTHash diverges *and* there are missing value MACs (warn > 0), the divergence is attributable to the pruned snapshot. Log and continue.
+- When LTHash diverges *without* missing MACs, the state is permanently desynced. Log and continue (still safer to proceed than to wedge forever).
+- The patchMAC check (a separate integrity check) only runs when LTHash agrees and there are no missing MACs, so corrupt patches still get rejected.
 
-Key lookup failures still propagate as errors (only LTHash mismatches are skipped). The patchMAC integrity check (separate from LTHash) still runs when it can.
+The fork's commits live on `main` in `github.com/drapesinc/whatsmeow` and are rebased on top of upstream `tulir/whatsmeow` whenever upstream is pulled forward.
 
-### If the Patch Breaks After a whatsmeow Update
+### If Upstream Changes the Surrounding Code
 
-The Dockerfile has a `grep -q` verification step that fails the build if the sed didn't match. If whatsmeow refactors `validateSnapshotMAC`, the build will fail clearly. To fix:
-
-1. Check the new version's `appstate/decode.go` for the equivalent error string
-2. Update the sed pattern in the Dockerfile
-3. Rebuild
+A rebase conflict in `appstate/decode.go` is the canonical signal that upstream has touched the patch validation path (e.g., the 2026-04 constant-time-comparison change). Resolve in `~/Dev/whatsmeow-fork`, keep the fork's `if err == nil && len(warn) == 0` guard around any new patchMAC check, then force-push.
 
 ---
 
